@@ -1,0 +1,444 @@
+% ======================================================================
+% Appendix (2026-09-25): implementation, dataset-construction and
+% reproducibility details moved out of the Method section.  Every number
+% was verified against the repository on 2026-09-25 (see the header of
+% sections/method.tex.v1_long for the source files).
+% ======================================================================
+
+\section{Data Curation Details}
+\label{app:data_curation}
+
+\paragraph{Source data and frame sampling.}
+The official Stereo4D index lists 108,015 clips; 3D tracks are released for 89,454 of them, which form our candidate pool.
+Every clip is decoded from the rectified left view at $512\times512$ pixels and temporally subsampled from the native 30~fps with a per-clip stride $\sigma=\min\!\big(\max(1,\lfloor (N-1)/19\rfloor),\,6\big)$, where $N$ is the number of source frames, so that a clip keeps 20--34 frames (up to 38 are accepted) at an effective rate of $30/\sigma$~fps.
+Over the delivered scenes, 76.9\% use stride~6 (5~fps); the frame count ranges from 20 to 38 with a median of 34, and 67.6\% of the scenes have exactly 34 frames.
+The per-frame timestamps of the release are kept with every scene. Trajectory tokens and QA targets use these timestamps; stage-1 motion captions instead use the metadata frame rate. The two time sources disagree by more than 10\% in 12.85\% of scenes, which introduces noise into time-dependent caption targets.
+
+\paragraph{Curation steps.}
+A clip enters the training set only if at least one object moves in the world frame and this motion is observable both in the released tracks and in the image.
+The steps, and the number of clips each removes, are (the funnel in Fig.~\ref{fig:pipeline} summarizes them as 108k $\rightarrow$ 42k):
+\begin{itemize}
+\item \emph{Object inventory.} A VLM (Qwen3-VL-Plus) inspects 8 uniformly spaced frames and returns, for every object, a category label, a 2D box on one frame, a rigid/non-rigid attribute and a static/dynamic attribute; the prompt asks it to discount camera motion. Clips in which every object is static are discarded before any further processing (29,915).
+\item \emph{Instance masks.} SAM~3 is prompted with each label and its box on the VLM's frame (text-only retry on failure) and propagates the mask bidirectionally through the clip. Masklets whose largest single-frame area is below 0.3\% of the image are dropped, and masklets of different concepts with temporal IoU above 0.5 are merged. Clips in which no dynamic object obtains a mask are discarded (9,207, of which 1,292 receive no mask at all).
+\item \emph{Track attribution.} Every released 3D track is projected into the frames and attributed to the instance whose mask (dilated by 4~px) contains at least 50\% of its visible projections and beats the runner-up by a margin of 0.15; only tracks visible in at least 3 frames are eligible, and at most 800 tracks per instance are kept by farthest-point sampling. A dynamic instance is kept only if it owns at least 8 tracks (4 for a static instance), one of which falls on its undilated mask. Clips whose dynamic objects all fail this test are discarded (5,725).
+\item \emph{Motion check.} A one-way gate demotes a dynamic instance to static when the median world-frame speed of its tracks is below 0.05~m/s and a static 3D point explains its tracks up to a median image residual of 1~px; it never promotes a static instance. Clips whose last dynamic object is demoted are discarded (2,444).
+\item \emph{Failures.} 11 clips failed (7 rejected by the VLM API's content filter, 4 pipeline give-ups).
+\end{itemize}
+
+\paragraph{Outcome and splits.}
+The remaining 42,152 clips come from 4,079 source videos; one clip with a corrupt reconstruction file is excluded from QA generation, leaving 42,151 QA scenes with, on average, 9.9 objects and 44.8 keypoints per scene (20.7 on moving objects).
+Since a source video contributes several clips (median 5, up to 160; 98.4\% of the clips share their video with at least one other clip), the QA splits are made by hashing source-video id. The separate stage-1 caption training selection excludes QA evaluation scenes; its source-video-level relation to the QA splits is not documented here.
+The pipeline's numerical gates check consistency among attributed tracks, projected motion, and serialized answers. They do not provide an independent measurement of metric reconstruction fidelity or a human audit of object identity and mask correctness. Errors in either upstream stage can therefore survive a token-side answer check.
+
+% ----------------------------------------------------------------------
+\section{Trajectory Representation Pipeline Details}
+\label{app:pipeline}
+
+\paragraph{Tracking module.}
+Two interchangeable implementations produce the same output, namely per-object dense 3D tracks with per-frame visibility, together with camera poses.
+(i)~For ordinary monocular video we use Track4World: a dense grid of query points is seeded inside every instance mask (about 200 seeds per object, at most 2,000 tracks), tracked in a few shared passes with the first camera as world frame, and re-tracked once more at the reference frame $t^\ast$ after the mesh is available.
+(ii)~For datasets that release 3D tracks we use the released tracks, attributed to instances as in Appendix~\ref{app:data_curation}.
+All Stereo4D scenes in this paper use (ii); none of our training trajectories comes from a learned tracker.
+
+\paragraph{Tracker selection.}
+We selected Track4World after a bake-off of five 3D trackers on three datasets (Table~\ref{tab:bakeoff}): DAVIS (no 3D ground truth; only the fraction of tracked points that stay on the object mask is measured), MOVi and PointOdyssey (3D ground truth).
+Evaluation points were unified across trackers and queries were released at the same frames.
+Track4World has the highest DAVIS on-mask score and the best EPE-2D, $\delta_8$, and OA values on MOVi and PointOdyssey in this table. Other methods obtain the lowest EPE-3D on those two datasets, so the choice reflects the tracking and visibility metrics used by the pipeline rather than a uniform win across metrics.
+% Source: EXPERIMENTS_ARCHIVE.md §1 (scoreboard EXPERIMENTS_ARCHIVE/bakeoff2/scoreboard.json).  The re-lock
+% rate at 20 frames is omitted from the table: on MOVi it rests on single-digit sample counts.
+
+\begin{table}[t]
+\caption{Tracker bake-off (five trackers, three datasets). EPE-2D is measured in pixels and EPE-3D in each dataset's 3D coordinate units (lower is better); $\delta_8$ is the fraction of points within 8~px, OA is occlusion accuracy, and on-mask is the fraction of tracked points remaining on the object mask (higher is better). Bold marks the best available value for each dataset and metric.}
+\label{tab:bakeoff}
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llrrrrr}
+\toprule
+\textbf{Tracker} & \textbf{Dataset} & \textbf{EPE-2D}$\downarrow$ & $\boldsymbol{\delta_8}\uparrow$ & \textbf{OA}$\uparrow$ & \textbf{EPE-3D}$\downarrow$ & \textbf{on-mask}$\uparrow$ \\
+\midrule
+Track4World & DAVIS & -- & -- & -- & -- & \textbf{0.9155} \\
+ & MOVi & \textbf{1.722} & \textbf{0.9257} & \textbf{0.8778} & 0.3532 & -- \\
+ & PointOdyssey & \textbf{10.410} & \textbf{0.5597} & \textbf{0.8296} & 0.3087 & -- \\
+\midrule
+TAPIP3D~\citep{zhangTAPIP3DTrackingAny2025} & DAVIS & -- & -- & -- & -- & 0.9032 \\
+ & MOVi & 1.836 & 0.9124 & 0.8599 & 0.4259 & -- \\
+ & PointOdyssey & 23.462 & 0.3647 & 0.7182 & 0.6936 & -- \\
+\midrule
+SpaTrackerV2~\citep{xiaoSpatialTrackerV23DPoint2025} & DAVIS & -- & -- & -- & -- & 0.8970 \\
+ & MOVi & 1.918 & 0.9043 & 0.8576 & 0.4908 & -- \\
+ & PointOdyssey & 16.937 & 0.4130 & 0.7795 & \textbf{0.3029} & -- \\
+\midrule
+4RC~\citep{luo4RC4DReconstruction2026} & DAVIS & -- & -- & -- & -- & 0.7417 \\
+ & MOVi & 2.031 & 0.9066 & 0.8541 & \textbf{0.2653} & -- \\
+ & PointOdyssey & 100.364 & 0.3320 & 0.3931 & 0.3546 & -- \\
+\midrule
+D4RT~\citep{zhangEfficientlyReconstructingDynamic2025} & DAVIS & -- & -- & -- & -- & 0.5898 \\
+ & MOVi & 2.852 & 0.8583 & 0.8480 & 0.3695 & -- \\
+ & PointOdyssey & 234.402 & 0.0031 & 0.7304 & 1.6874 & -- \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\paragraph{Object geometry and keypoints.}
+Objects are routed by type.
+\emph{Non-rigid dynamic} objects are reconstructed with SAM 3D Objects (Fast-SAM3D implementation~\citep{fengFastSAM3D3DfyAnything2026}) from the best of at most three candidate reference frames (chosen by mask agreement), segmented into semantic parts with PartSAM (fragments are merged into neighbouring parts), and sampled on the mesh surface in two passes: the first draws farthest-point, curvature-weighted vertices per part until a coverage of 0.10 part diagonals is reached (at most 64 per part); the second keeps one medoid keypoint per semantic part among candidates that are visible in at least half of the frames, and discards points that are never observed.
+\emph{Rigid dynamic} objects skip the mesh when the VLM calls them rigid, a conservative rigidity test on their raw tracks agrees, and they are present in a single contiguous segment; they receive 4 farthest-point keypoints and a per-frame pose $(\mR_t,\vt_t)\in SE(3)$ obtained by Kabsch alignment over all tracked keypoints (the pose is marked undefined when fewer than $\max(3,0.1T)$ frames are solved or the reconstruction residual exceeds one bounding-box extent).
+\emph{Static} objects keep 4 representative points (farthest-point sampling of per-track median positions) and no mesh.
+
+\paragraph{Keypoint--pixel--track linking.}
+At the reference frame $t^\ast$ the track coordinate frame is aligned to the mesh by a Umeyama similarity; every keypoint is projected into the image and linked to the dense track that passes through that pixel; keypoints occluded at $t^\ast$ are placed by the SE(3) motion of their part before linking.
+Each keypoint thereby inherits one metric 3D track over the whole clip together with its per-frame visibility.
+The pipeline output for static objects consists of their representative points only.
+
+% ----------------------------------------------------------------------
+\section{Tokenization and Projector Details}
+\label{app:tokenization}
+
+Throughout, $T$ is the number of frames of the scene and $d$ the diagonal of the trajectory AABB enclosing an object's visible normalized points across time; $d$ includes motion extent and is not necessarily the object's physical size.
+
+\paragraph{Scene normalization.}
+All visible keypoint positions of a scene are shifted by their centroid $\boldsymbol{\mu}$ and scaled isotropically by the maximum radius $s$, $\tilde{\vp}=(\vp-\boldsymbol{\mu})/s$, so that the scene lies in the unit sphere; $(\boldsymbol{\mu},s)$ are emitted in the scene header (for the clip in Fig.~\ref{fig:tokenization}, $\boldsymbol{\mu}=(1.46,2.12,10.06)$~m and $s=10.23$~m).
+A low-motion check re-labels a dynamic object as static when its world-frame motion is at most 5~cm and its reprojection shows no image motion (residual below 1~px).
+
+\paragraph{Event detection.}
+Inside a visible run we detect two kinds of events on the inter-frame displacements $\vDelta_t=\tilde{\vp}_{t+1}-\tilde{\vp}_t$: a \emph{reversal} at frame $t$ if
+$\langle\vDelta_{t-1},\vDelta_t\rangle<0$ and $\|\vDelta_{t-1}\|,\|\vDelta_t\|>\delta$ with the noise floor $\delta=\max\big(0.02\,d,\;0.1\,\mathrm{median}_{t:\|\vDelta_t\|>0}\|\vDelta_t\|\big)$, and an \emph{impact} at $t$ if the second difference $a_t=\|\tilde{\vp}_{t+1}-2\tilde{\vp}_t+\tilde{\vp}_{t-1}\|$ is a local maximum exceeding $\max(\mu_a+2\sigma_a,\,0.05\,d)$.
+The run is split at every event frame; adjacent events are not merged.
+
+\paragraph{Fitting procedure.}
+We use FITPACK's smoothing spline (\texttt{splprep}) and bisect its smoothing factor (30 iterations) to the largest value that satisfies the target bound in Eq.~\ref{eq:fit}; adaptive knots concentrate nodes on motion that is harder to fit.
+A piece may use at most $n=12$ coefficients; if the bound cannot be met within this budget the best fit is kept and counted as a bound failure in preprocessing (3,088 of the 1,729,834 pieces in our data, 0.18\%). No dedicated fit-status field is serialized to the model.
+Pieces with fewer than five frames use the lowest degree that meets the bound (a line with 2 coefficients, else a quadratic with 3, else interpolation of all points), and a piece with a single frame is one point.
+During preprocessing, the control points can be recovered numerically from the Greville nodes and the fitted knot vector to $10^{-12}$. The LLM receives the node records, not that knot vector; Gate~0 therefore recomputes targets by interpolating the serialized nodes rather than relying on exact spline reconstruction.
+Knot-type flags are assigned as follows: \emph{endpoint} for the first and last node of a run, \emph{reversal} or \emph{impact} for the two event-side boundary nodes, and \emph{smooth} otherwise. Since fits are smoothed separately, event-side node positions are not guaranteed to coincide exactly.
+
+\paragraph{What the fit bound measures.}
+Let $\hat{\vp}(t)$ denote the piecewise-linear path decoded from the serialized nodes after the record cap. Eq.~\ref{eq:fit} controls the fitted spline at observed frames, whereas the model and Gate~0 use $\hat{\vp}(t)$. Because the knot vector is omitted, that bound does not imply an equal bound for the decoded path. Gate~0 only verifies that the decoded answer remains in the same option cell (or gives the same categorical answer), which is weaker than bounding trajectory error. Each of the three principal numeric questions is determined by two decoded endpoint positions and their timestamps; consequently, these questions do not by themselves test whether interior event nodes, part labels, or adaptive sampling are needed. At a split event, the two fitted sides can produce distinct samples at the same time; the available manuscript does not specify the implementation's duplicate-time interpolation rule or report decoded-path error statistics. These details require a code-level audit before asserting a stronger fidelity guarantee.
+
+\paragraph{Rigid objects and the camera.}
+A rigid object is described by its keypoints' reconstruction $\vp_j(t)=\mR_t\,\tilde{\vr}_j+\vc(t)$, where $\tilde{\vr}_j$ are its reference points relative to their centroid and $\vc(t)$ is the normalized centroid trajectory.
+Per run we fit the translation $\vc(u)$ and the rotation $\vphi(u)=\log(\mR_{f_0}^{\top}\mR(u))$ (rotation vector relative to the first frame of the run, unwrapped modulo $2\pi$) jointly as one 6-D curve $[\vc(u),\,\rho\,\vphi(u)]$ with shared knots, where $\rho=\max_j\|\tilde{\vr}_j\|$ converts radians into length, and the error bound of Eq.~\ref{eq:fit} is evaluated on the reconstructed keypoints, $\max_{i,j}\|\mR_{f_0}\exp(\vphi(u_i))\,\tilde{\vr}_j+\vc(u_i)-\tilde{\vp}_j(f_i)\|\le\varepsilon$.
+Rotation nodes are serialized as absolute rotation vectors.
+The camera is encoded as a rigid pseudo-object appended last, whose translation stream is the optical centre (error bound $\min(\varepsilon,\,0.10\text{ m}/s_{\mathrm{norm}})$ in normalized coordinates, at most 48 coefficients). Here $s_{\mathrm{norm}}=s$ is the scene normalization radius in metres, not elapsed seconds.
+
+\paragraph{Token record.}
+Every token is a record with seven discrete and three continuous fields (Table~\ref{tab:token-fields}); fields that do not apply to a role are masked by a presence flag.
+Besides the node tokens there are structural tokens: three scene-header tokens (frame count and clip duration; normalization centre; normalization scale), one object-header token per object (kind, VLM type, instance index, number of parts, and for rigid objects the SE(3) reconstruction residual), up to four point tokens per static object, the reference-point tokens of rigid objects, and, per non-rigid keypoint, one visibility-summary token and one token per occlusion gap.
+
+\begin{table}[t]
+\caption{Fields of a trajectory token. Discrete fields are embedded and continuous fields are projected by the adapter in Sec.~\ref{sec:train}. Declared cardinalities include reserved and padding values beyond the semantic values listed; this table defines fields rather than performance metrics.}
+\label{tab:token-fields}
+\begin{center}
+\small
+\begin{tabular}{llp{7.3cm}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Values} \\
+\midrule
+role & discrete (12) & scene header, normalization centre, normalization scale, object header, static point, rigid reference point, rotation node, translation node, keypoint node, occlusion gap, visibility summary \\
+knot type & discrete (5) & smooth, reversal, impact, endpoint \\
+kind & discrete (4) & static, rigid, non-rigid \\
+object type & discrete (4) & rigid, non-rigid (VLM attribute) \\
+instance & discrete (65) & per-scene object index \\
+part & discrete (17) & semantic part index within the object \\
+keypoint & discrete (129) & keypoint index within the part \\
+\midrule
+xyz & continuous (3) & normalized position, rotation vector, reference point, or gap interval \\
+$u$ & continuous (1) & normalized time in the clip, $u=f/(T-1)$ \\
+$t$ & continuous (1) & absolute time in seconds from the frame timestamps \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\paragraph{Serialization and budget.}
+The tokens of a scene are serialized as one sequence: the scene header, then every object in order, and the camera last.
+Each object is introduced by its category label as ordinary text, followed by its object-header token; a non-rigid object nests its parts as \texttt{[part 1]}, \texttt{[part 2]}, \dots, each followed by the tokens of that part's keypoints (visibility summary, gaps, nodes); a rigid object lists its reference points, rotation nodes and translation nodes; a static object its points.
+Several instances of the same category share the same text label, and their identity is carried by the instance field.
+Over the 42,151 scenes a clip has a median of 165 trajectory tokens (mean 231, 90th percentile 507, maximum 2,227); for comparison, the 8 video frames occupy 1,152 visual tokens.
+At training time a sample is capped at 512 trajectory tokens by keeping all structural tokens and all reversal/impact nodes and thinning the remaining nodes uniformly.
+
+\paragraph{Projector dimensions and injection.}
+In Eq.~\ref{eq:projector} every embedding table $\mE_k$ and every linear map $\mW_{\vx},\mW_u,\mW_t$ has 456 output dimensions, so the concatenation has $10\times456=4{,}560$ dimensions; $\mW_{\mathrm{f}}\in\R^{4096\times4560}$ maps it to the LLM dimension $D=4096$, and the MLP is $4096\to8192\to4096$ with GELU.
+The output replaces the embedding of the corresponding \texttt{<|traj\_pad|>} placeholder by a masked scatter into the LLM's input embeddings, before the visual tokens are inserted.
+The final LayerNorm sets the norm of every injected vector to $\sqrt{D}=64$.
+
+% ----------------------------------------------------------------------
+\section{Question Generation Details}
+\label{app:qa}
+
+\begin{table}[t]
+\caption{Question families and complete numeric grid parameters for TrajQA-B (descriptive table; no performance metric). Numeric families are 4-way with options taken from a fixed logarithmic grid $v_k=v_0\,r^{k}$ ($r=1.35$); the remaining families are 2-way. The internal name speed\_grid denotes endpoint displacement rate. Numeric questions specify frame indices without stating the elapsed time; the duration family instead specifies a time threshold.}
+\label{tab:qa-families}
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lp{5.6cm}lc}
+\toprule
+\textbf{Family} & \textbf{Asks for} & \textbf{Options} & \textbf{Needs time?} \\
+\midrule
+disp\_grid & world-frame displacement of an object in $[i,j]$ (m) & grid, $v_0=0.5$, 12 cells & no \\
+speed\_grid & endpoint displacement rate of an object in $[i,j]$ (m/s) & grid, $v_0=0.1$, 14 cells & yes \\
+cam\_disp\_grid & displacement of the camera in $[i,j]$ (m) & grid, $v_0=0.5$, 13 cells & no \\
+interval\_disp & which of two adjacent intervals covers the longer distance & 2-way & no \\
+interval\_speed & which interval has greater endpoint displacement rate & 2-way & yes \\
+motion\_source & whether the screen motion is due to the object or the camera & 2-way & no \\
+motion\_duration & whether the object keeps moving for more than $X$ seconds & yes/no & yes \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\paragraph{Reference quantities and observability guards.}
+The object position at frame $t$ is the per-frame median of its visible keypoints (for rigid objects the pose applied to the reference points), i.e.\ the same quantity the tokens encode; the camera position is the optical centre from the released poses.
+Displacement is the Euclidean distance between the positions at frames $i$ and $j$; the benchmark's ``speed'' target divides this endpoint displacement by elapsed time (intervals shorter than 0.5~s are excluded). It is the magnitude of average velocity, not path length divided by time. Motion duration is the longest contiguous span in which the per-frame speed exceeds 0.05~m/s and the object moves by at least 10~px in a frozen-camera projection.
+Windows are random pairs of visible frames with $j-i\ge3$; the two intervals of the comparison families are adjacent, with equal length for interval\_disp and a length ratio of at least 1.5 for interval\_speed, and their displacements (speeds) must differ by a factor of at least 1.4.
+A question is generated only if the asked quantity is observable: the displacement must exceed $\max(0.5\text{ m},\,3\,\eta(z))$, where $\eta(z)$ is a depth-dependent noise level of the stereo reconstruction (0.05~m below 5~m, 0.25~m below 10~m, 0.53~m below 20~m, 0.90~m below 40~m; objects beyond 40~m are excluded); the object must move by at least 10~px under a frozen camera; the keypoint-based displacement must agree with the displacement of the object's dense tracks within $\max(0.3\text{ m},0.3\,d)$; radial motion must be corroborated by the change of apparent size; and speeds above 6~m/s for humans (30~m/s otherwise) are rejected.
+For motion\_source, the ``camera'' side uses only static objects of movable categories (humans, vehicles, animals) under a camera that moves by at least 0.5~m or 5$^\circ$, and the ``object'' side only dynamic objects under a camera that moves by at most 0.10~m and 1$^\circ$; both require at least 40~px of screen motion.
+An object is referred to by its label when it is unique in the scene, or as ``the left/right \emph{label}'' when exactly two instances are separated horizontally by at least 15\% of the image width in every frame the question involves.
+
+\paragraph{Options and balancing.}
+Numeric options are the geometric centres of four \emph{adjacent} cells of a fixed global logarithmic grid, $v_0 r^{w+k+0.5}$ for $k=0,\dots,3$, chosen so that the cell of the true value is one of the four; the four letters are randomly permuted, and true values that fall within 6\% of a cell edge are discarded.
+The grid is global rather than adapted to a scene. The true cell's rank within the window is balanced by a linear program (per stratum of object class $\times$ frame-distance bin) so that $P(\text{rank}\mid\text{window})$ is uniform. This limits common rank and class-median shortcuts, though the question-only controls show that residual bias is possible.
+The 2-way families are balanced in cells of question-visible context: interval\_disp per object class over both answers and over whether the longer-displacement interval is the first one; interval\_speed per class, duration-ratio bin and split-point position, keeping in equal numbers only the cases where the faster interval is the longer one with the larger displacement and where it is the shorter one with the smaller displacement, so that neither ``the longer interval'' nor ``the larger displacement'' predicts the answer; motion\_source per class, label, clip length, frame distance, frame rate and screen position over both answers.
+Within every cell the answer letter alternates strictly.
+Per object and family, windows with an overlap ratio above 0.7 are not repeated; at most 80 questions per family and 300 questions in total are drawn from any source video.
+
+\paragraph{Admission gates.}
+\emph{Gate 0 (token-side recomputation, hard).} For every candidate we rebuild the object (or camera) trajectory from exactly what the model sees---the serialized node positions and times after the 512-token cap, linearly interpolated between nodes, denormalized with the scene centre and scale---and recompute the answer; a question is dropped unless the recomputed value falls in the same grid cell (numeric families) or yields the same answer (2-way and yes/no families).
+\emph{Gate 1 (text-shortcut audit).} On the finished splits we fit, on the training questions, a ridge regression from bag-of-words, frame indices and window position to the nearest option, a logistic regression predicting the rank of the answer, and fixed rules (always the $k$-th smallest option, family or class medians; for 2-way families the longer or first interval, always camera, always yes), and require every predictor to score within 3 points of chance on the test questions; on the final splits the numeric families score 0.252--0.262 (chance 0.25).
+\emph{Gates 2--3 (post-training).} After training we evaluate every model with the question only (no frames, no tokens) and, for token-reading models, with the tokens of a different scene substituted for the true ones (format, count and timestamps unchanged); these controls are reported in Sec.~\ref{sec:experiments}.
+Finally, a validation script checks every build: zero overlap of source videos, question ids and (video, object, window, family) tuples between splits; Gate~0 consistency of every retained question; rank-per-window and answer-side deviations below $10^{-9}$; and no window pair of the same object and family with overlap above 0.8.
+
+\paragraph{Splits and counts.}
+QA splits are formed on the hash $u\in[0,1)$ of the source-video id: $u<0.2$ is the test split, $[0.2,0.25)$ the validation split used for model selection, and $[0.25,0.30)$ a held-out QA split; the training split takes the remaining videos. This separation applies to QA fine-tuning, not necessarily to the earlier caption-based projector warm-up described in Appendix~\ref{app:training}.
+From 42,151 scenes the generator produced 333,661 candidates, of which 65,360 questions survived the gates and balancing (Table~\ref{tab:qa-splits}); the training split was additionally resampled so that its family proportions match the test split (camera 38\%, object displacement 29\%, speed 27\%).
+% Family counts (verified 2026-09-25): train 21,240 / 16,492 / 14,980 / 460 / 388 / 1,068 / 1,492;
+% val 524 / 404 / 340 / 8 / 16 / 22 / 4; test 1,692 / 1,284 / 1,212 / 36 / 88 / 84 / 96; held-out 1,600 / 888 / 824 / 40 / 12 / 62 / 4
+% (order: cam_disp, disp, speed, interval_disp, interval_speed, motion_source, motion_duration).
+Every question is paired with a structured target: the evidence lists world-frame positions at the two frames in metres, the resulting displacement, and the elapsed time and speed where relevant, followed by the option letter.
+
+% ----------------------------------------------------------------------
+\section{Training Details}
+\label{app:training}
+
+\paragraph{Model and optimization.}
+The backbone is Qwen3-VL-8B-Instruct.
+Its vision encoder and all base weights stay frozen; we train the Trajectory Token Projector (85.93M parameters) and LoRA adapters on the language model (rank 128, $\alpha=256$, dropout 0.05, on the query, key, value, output, gate, up and down projections; 349.18M parameters).
+The projector embeddings are added to the input through a wrapper of the embedding layer, so gradients reach the projector even when the LLM is frozen.
+A sample consists of 8 frames sampled uniformly over the whole clip (longest side 384~px, 144 visual tokens per frame), the serialized trajectory block with its text labels (at most 512 trajectory tokens), and the instruction or question; there is no system prompt and no per-frame timestamp.
+For questions the prompt ends with an instruction to list the determining trajectory facts inside \texttt{<evidence>} tags before giving the letter inside \texttt{<answer>} tags, and the loss is the standard next-token cross-entropy on the whole assistant text (evidence and answer); prompt, image and trajectory positions are not supervised.
+All stages use AdamW ($\beta=(0.9,0.95)$, no weight decay), gradient clipping at 1.0, a global batch of 16 samples, bf16 weights for the LLM, and seed 0.
+
+\paragraph{Caption generator (stage 1).}
+The captions are produced from the 4D tracks by a deterministic, camera-independent generator: one \emph{scene inventory} item per scene (``Moving in the world frame: \ldots\ Staying in place: \ldots'') and one \emph{object motion} item per uniquely labelled moving object (net displacement in metres, mean speed in m/s, acceleration or deceleration when the mean speeds of the first and last thirds of the clip differ by a factor of at least 1.5, slowing to a stop, the frame of a direction reversal, and approaching, moving away from or moving faster than another object), 65,556 captions in total (42,030 inventories, 23,526 object descriptions), split by source video into 64,523 training and 1,033 validation captions.
+Stage 1 receives frames and trajectory tokens as input and generates the caption; only the projector is trained (no LoRA). The 42,030 caption scenes belong to a separately selected caption corpus, not a subset of the 42,151 QA scenes. Its 64,523 training captions exclude the 3,103 QA evaluation scenes. The exact source-video-level intersection, the selection rule relating the two corpora, and any overlap with caption validation are not documented in the available manuscript; these require a scene-ID manifest audit.
+
+\paragraph{Schedules.}
+\emph{Stage 1.} The projector is kept in fp32 and trained for 26,000 steps (about 6.4 epochs): 500 warm-up steps, a constant learning rate of $2\times10^{-4}$ until step 24,000, then a linear decay to zero over 2,000 steps.
+\emph{Stage 2.} Starting from the stage-1 projector, LoRA adapters are added and trained together with the projector on the 56,120 training questions with the frames withheld. The learning rate is $1\times10^{-4}$ for the adapters and $2\times10^{-4}$ for the projector, with 180 warm-up steps, a constant phase until step 7,000 and a linear decay to zero over 1,400 steps (8,400 steps, about 2.4 epochs); the length of the constant phase and of the decay were chosen on the validation split.
+\emph{Stage 3.} Adapters and projector continue from stage 2 with the frames restored; each training sample independently loses its 8 frames with probability 0.2 (trajectory tokens are never dropped). The schedule is one epoch (3,507 steps) with 105 warm-up steps (3\%) and cosine decay to zero at the same peak learning rates; the checkpoint at the end of the epoch is used without any selection.
+Table~\ref{tab:train} summarizes the three stages.
+At inference we decode greedily and read the letter inside the \texttt{<answer>} tags.
+
+\begin{table}[t]
+\caption{Training hyperparameters (descriptive, not performance metrics). All stages use a global batch of 16, AdamW without weight decay and seed 0; peak LR gives the LoRA / projector learning rates.}
+\label{tab:train}
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lp{2.3cm}lcp{3.3cm}r}
+\toprule
+\textbf{Stage} & \textbf{Inputs} & \textbf{Trainable} & \textbf{Peak LR} & \textbf{Schedule} & \textbf{Steps} \\
+\midrule
+1 warm-up   & frames + tokens            & projector (fp32) & --~/~$2\!\times\!10^{-4}$        & 500 warm-up; constant; linear over steps 24,000--26,000 & 26,000 \\
+2 token-only & tokens                    & LoRA + projector & $10^{-4}$~/~$2\!\times\!10^{-4}$ & 180 warm-up; constant; linear over steps 7,000--8,400   & 8,400 \\
+3 joint     & frames ($p{=}0.8$) + tokens & LoRA + projector & $10^{-4}$~/~$2\!\times\!10^{-4}$ & 105 warm-up (3\%); cosine to zero over one epoch       & 3,507 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+% ----------------------------------------------------------------------
+\section{Experimental Setup}
+\label{app:exp_setup}
+
+\paragraph{Evaluation set and metrics.}
+We evaluate on the held-out and test QA splits of TrajQA-B (Sec.~\ref{sec:qa}; $3{,}430+4{,}492=7{,}922$ questions). Their scenes were excluded from stage-1 training and their source videos from stages~2--3 training and checkpoint selection. The stage-1 source-video and validation-set relation to QA evaluation still needs an ID-level audit.
+The main metric is pooled accuracy over the three numeric families (camera displacement, object displacement, endpoint displacement rate; $n=7{,}500$; 4-way, uniform-guessing accuracy 25.0), also reported per split and per family; the mean accuracy over the four small 2-way and yes/no families ($n=76$--$146$ each) is reported but not interpreted.
+All trained-model results come from a single seed. Because questions are clustered by source video, question-level binomial standard errors are not a valid measure of across-video uncertainty; source-video bootstrap intervals were not available for this version.
+
+\paragraph{Baselines and protocol.}
+The evaluated families include Qwen3-VL~\citep{baiQwen3VLTechnicalReport2025}, InternVideo2.5~\citep{wangInternVideo25EmpoweringVideo2025}, InternVL3.5~\citep{wangInternVL35AdvancingOpenSource2025}, VG-LLM~\citep{zhengLearningVideos3D2025}, VLM-3R~\citep{fanVLM3RVisionLanguageModels2026}, and MLLM-4D~\citep{yinMLLM4DVisualbasedSpatialTemporal2026}. Exact proprietary API version strings, query dates, and several released checkpoint identifiers are not specified here, limiting exact replication of the baseline scores.
+Baselines are evaluated zero-shot with frames sampled uniformly over the whole clip, greedy decoding and the first option letter in the output.
+The open-source 7--8B models use a controlled protocol with our visual budget (8 frames at 384~px, no timestamps); the larger and the specialised models use their official video configuration (all frames at 512~px or the official number of segments, official visual pathway, timestamps given).
+The two protocols agree: Qwen3-VL-32B scores 28.1 under the controlled and 27.8 under its official configuration.
+The two proprietary models are queried through their APIs with 8 frames at 512~px and timestamps on a random subset of 1,000 questions (500 per split; 998 answered by GPT-6 Astra). The available result record does not specify whether its two unanswered questions were counted as incorrect or excluded from the denominator.
+MLLM-4D-SFT is run with its official usage (32 frames through the official video processor with timestamps, and the official answer parser).
+Stages 2--3 of our model are fine-tuned on the TrajQA-B training split, whose source videos are disjoint from both QA evaluation splits; stage-1 training uses a separately selected caption corpus without QA evaluation scenes as noted in Appendix~\ref{app:training}. The comparison with zero-shot models is protocol-mismatched.
+The frames-only arm uses the same QA question split, but its full optimization schedule and checkpoint-selection rule are not specified here; it should therefore be treated as a task-adapted visual reference, not a fully training-matched ablation.
+For the donor intervention, the recorded protocol preserves token format, count, and timestamps while replacing trajectory content with another scene's. Donor sampling and object/part mapping are not specified here, so this intervention is a coarse sensitivity test rather than a fully reproducible matched control.
+
+\paragraph{MLLM-4D-SFT is not zero-shot.}
+Its SFT set is built from Stereo4D like TrajQA-B: 2,635 of the 3,103 evaluation clips are in it.
+Its 25.0\% pooled score is consistent with an option-position shortcut: in its 856k numeric training questions the correct option is the second- or third-smallest value 99.4\% of the time; on TrajQA-B it picks the third-smallest option in 92.6\% of numeric questions, whereas TrajQA-B balances the answer positions (25\% each).
+Among the overlap categories available in the audit, it scores 24.9 on 6,332 numeric questions from clips in its SFT data and 26.1 on 904 questions from videos absent from that data. These categories cover 7,236 of the 7,500 numeric questions; the remaining 264 were not classified in the available breakdown.
+
+\paragraph{Evidence metrics.}
+From the generated evidence we parse the stated positions and displacement or benchmark ``speed''; we report median L2 position error (objects and camera separately) and the fraction whose stated quantity is within a multiplicative factor of 1.2 of the reference, i.e.\ $|\log(\text{stated}/\text{reference})|<\log 1.2$. Evidence is directly supervised during training, so this diagnostic is not an independent proof of the model's internal reasoning process.
+
+\paragraph{Full result tables.}
+Tables~\ref{tab:main-full} and~\ref{tab:ablation-full} report checkpoint size and the mean accuracy over the four small non-numeric families; all numeric-family results are in Tables~\ref{tab:main} and~\ref{tab:ablation}.
+
+\begin{table}[t]
+\caption{Supplementary comparison columns. Checkpoint size (GB) is descriptive; non-numeric question accuracy (\%) is higher-is-better ($\uparrow$). Bold marks the maximum in this column. These small question families are reported for completeness and are not used for the main comparison. Numeric results for every model appear in Table~\ref{tab:main}.}
+\label{tab:main-full}
+\begin{center}
+\small
+\begin{tabular}{lrc}
+\toprule
+\textbf{Model} & \textbf{Checkpoint (GB)} & \textbf{Non-numeric acc.}$\uparrow$ \\
+\midrule
+GPT-6 Astra & -- & 73.2 \\
+Claude Fable 5.1 & -- & 69.6 \\
+Qwen2.5-VL-7B & 15.4 & 62.3 \\
+Qwen3-VL-8B & 16.3 & 64.2 \\
+LLaVA-NeXT-Video-7B & 13.2 & 51.9 \\
+InternVideo2.5-8B & 15.0 & 57.6 \\
+InternVL2.5-8B & 15.0 & 63.0 \\
+InternVL3.5-8B & 15.9 & 62.1 \\
+Qwen2.5-VL-32B & 63.6 & 64.7 \\
+Qwen3-VL-32B & 62.1 & 66.4 \\
+InternVL2.5-38B & 71.5 & 59.2 \\
+InternVL3.5-38B & 71.5 & 60.4 \\
+VG-LLM & 17.2 & 57.8 \\
+VLM-3R & 17.4 & 55.5 \\
+MLLM-4D-SFT & 16.3 & 68.0 \\
+Ours (frames + trajectory tokens) & 17.9 & \textbf{90.3} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\begin{table}[t]
+\caption{Supplementary non-numeric ablation average (\%, higher-is-better $\uparrow$). Bold marks the maximum. These small question families are reported for completeness; the main input comparison is Table~\ref{tab:ablation}. A token-only non-numeric score was not in the available results.}
+\label{tab:ablation-full}
+\begin{center}
+\small
+\begin{tabular}{lc}
+\toprule
+\textbf{Inputs at inference} & \textbf{Non-numeric acc.}$\uparrow$ \\
+\midrule
+Question only & 49.5 \\
+Frames only (separate FT) & 80.8 \\
+Frames + donor tokens & 69.0 \\
+Trajectory tokens only & -- \\
+Frames + trajectory tokens (full) & \textbf{90.3} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\paragraph{Secondary diagnostics.}
+\emph{Trajectory tokens only.} The final model evaluated without frames scores 82.2 on the numeric families (81.5 on held-out, 82.8 on test; camera displacement / object displacement / endpoint rate 89.4 / 77.7 / 75.5). Its full-input score is the same to one decimal place; the separately trained frames-only arm scores 33.9 points lower than the full-input model. The latter difference is descriptive because training and visual inputs are not matched.
+\emph{Floors.} On held-out the full model is $+54.2$ points above its own question-only floor (81.7 versus 27.5) and $+51.1$ above the donor control (30.6); on the test split the corresponding numbers are 82.5 versus 26.2 ($+56.3$) and 28.8 ($+53.7$). The frames-only arm's own question-only floor is 25.7 (24.3 on held-out, 26.9 on test).
+\emph{Evidence metrics on the test split.} Median position error (objects / camera) and within-20\% rates (camera displacement / object displacement / speed): full model 0.32 / 0.10~m, 91.8 / 83.3 / 84.1\%; trajectory tokens only 0.32 / 0.10~m, 92.0 / 83.6 / 83.8\%; frames + donor tokens 3.05 / 1.09~m, 15.1 / 15.6 / 15.9\%; question only 3.16 / 0.64~m, 23.0 / 17.1 / 14.5\%.
+
+% ----------------------------------------------------------------------
+\section{Qualitative Results}
+\label{app:qualitative}
+
+\begin{table}[t]
+\caption{Endpoint-rate errors from Fig.~\ref{fig:teaser} and three examples below. Errors use rounded displayed predictions (m/s, $\downarrow$); bold is best within each row. These are illustrative cases.}
+\label{tab:cases}
+\begin{center}
+\small
+\setlength{\tabcolsep}{8pt}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Scene} & \textbf{Reference (m/s)} & \textbf{Frames-only error}$\downarrow$ & \textbf{Trajectory-input error}$\downarrow$ \\
+\midrule
+Bicycle & 4.13 & 2.84 & \textbf{0.18} \\
+Stroller & 0.64 & 0.31 & \textbf{0.16} \\
+Multiple people & 0.26 & 0.06 & \textbf{0.00} \\
+Position swap & 0.43 & 0.14 & \textbf{0.03} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+Figures~\ref{fig:qual-interaction}--\ref{fig:qual-swap} show four clips whose source videos are outside the stages 2--3 QA training split and whose scene IDs were excluded from stage-1 caption training. Each shows the moving objects' keypoint trajectories, a rule-generated motion caption, and one TrajQA-B question with outputs from the separately trained frames-only and trajectory-input models.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig4_complex_interaction_labels.pdf}
+\caption{\textbf{Complex interaction.} \emph{Top left:} three frames with estimated keypoint trajectories (colour encodes time). \emph{Top right:} the rule-generated motion caption. \emph{Bottom:} seal displacement between frames 1 and 27 (reconstruction-derived reference 1.56~m): frames only 1.1~m (wrong), frames and trajectory tokens 1.6~m (correct).}
+\label{fig:qual-interaction}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig4_complex_video_labels.pdf}
+\caption{\textbf{Complex video.} Same layout as Fig.~\ref{fig:qual-interaction}. The stroller's endpoint displacement rate between frames 5 and 16 (reference 0.64~m/s): frames only 0.95~m/s (wrong), frames and trajectory tokens 0.80~m/s (correct).}
+\label{fig:qual-video}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig4_multiple_people_labels.pdf}
+\caption{\textbf{Multiple people.} Same layout as Fig.~\ref{fig:qual-interaction}. The man's endpoint displacement rate between frames 4 and 18 (reference 0.26~m/s): both models answer correctly, frames only with 0.32~m/s and frames and trajectory tokens with 0.26~m/s.}
+\label{fig:qual-people}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig4_swapping_positions_labels.pdf}
+\caption{\textbf{Objects swapping positions.} Same layout as Fig.~\ref{fig:qual-interaction}. The woman's endpoint displacement rate between frames 25 and 32 (reference 0.43~m/s): frames only 0.29~m/s (wrong), frames and trajectory tokens 0.40~m/s (correct).}
+\label{fig:qual-swap}
+\end{figure}
+
+\clearpage
+\subsection{Additional qualitative examples}
+Five further selected clips are shown in Figures~\ref{fig:qual-approach}--\ref{fig:qual-horse}. Their embedded ``ground truth'' labels mean reconstruction-derived references, and any ``average speed'' question is scored as endpoint displacement divided by elapsed time. The cases illustrate answer and evidence differences; they are not a representative sample or component ablations.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{fig4b_approaching_person.pdf}
+\caption{\textbf{Approaching person.} Endpoint displacement rate from frames 0 to 6: reconstruction-derived reference 0.59~m/s, frames-only evidence 1.53~m/s (wrong option), and trajectory-input evidence 0.58~m/s (correct option).}
+\label{fig:qual-approach}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{fig4b_camera_motion.pdf}
+\caption{\textbf{Camera motion.} Camera displacement from frames 4 to 19: reconstruction-derived reference 0.64~m, frames-only evidence 1.3~m (wrong option), and trajectory-input evidence 0.6~m (correct option).}
+\label{fig:qual-camera}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{fig4b_carried_object.pdf}
+\caption{\textbf{Carried object.} Handbag displacement from frames 9 to 23: reconstruction-derived reference 0.62~m, frames-only evidence 1.3~m (wrong option), and trajectory-input evidence 0.6~m (correct option).}
+\label{fig:qual-carried}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{fig4b_crossing_truck.pdf}
+\caption{\textbf{Crossing truck.} Truck displacement from frames 7 to 14: reconstruction-derived reference 8.14~m, frames-only evidence 4.5~m (wrong option), and trajectory-input evidence 8.4~m (correct option).}
+\label{fig:qual-truck}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{fig4b_distant_animal.pdf}
+\caption{\textbf{Distant animal.} Horse endpoint displacement rate from frames 0 to 32: reconstruction-derived reference 0.22~m/s, frames-only evidence 0.56~m/s (wrong option), and trajectory-input evidence 0.22~m/s (correct option).}
+\label{fig:qual-horse}
+\end{figure}
+
+\clearpage
+
+\section{Limitations and Scope}
+\label{app:limitations}
+TrajQA-B is built from Stereo4D's reconstructed tracks. Its reference answers inherit errors in those tracks, masks, object assignments, and camera poses. Questions are deliberately defined to be answerable from the serialized records, so accuracy measures trajectory reading under this construction rather than recovery of 4D geometry from raw video or transfer to arbitrary motion tasks. Some original prompts use the phrase \emph{average speed} for endpoint displacement rate; this wording should be corrected when regenerating the benchmark. External baseline comparisons differ in supervision, visual processing, and sometimes evaluation subset. The separately trained frames-only arm is the closest visual comparison, but its full optimization schedule is unavailable and its eight sampled frames lack timestamps; queried endpoints may be absent. Stage-1 training excludes QA evaluation scenes, but its source-video and validation-set relation to QA evaluation has not been independently audited in the available records. Results use one training seed, and no experiment isolates the contribution of part labels, event splitting, adaptive spline fitting, or projector warm-up. Future evaluation should use independent motion ground truth, documented stage-1 source-video separation, matched frame and timestamp inputs, and component ablations.

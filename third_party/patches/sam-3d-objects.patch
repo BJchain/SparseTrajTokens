@@ -1,0 +1,19 @@
+--- a/notebook/inference.py	2026-10-04 17:39:17.560122063 +0800
++++ b/notebook/inference.py	2026-10-04 17:39:17.560122063 +0800
+@@ -104,6 +104,7 @@
+         mask: Optional[Union[None, Image.Image, np.ndarray]],
+         seed: Optional[int] = None,
+         pointmap=None,
++        with_layout_postprocess: bool = True,
+     ) -> dict:
+         image = self.merge_mask_to_rgba(image, mask)
+         return self._pipeline.run(
+@@ -113,7 +114,7 @@
+             stage1_only=False,
+             with_mesh_postprocess=False,
+             with_texture_baking=False,
+-            with_layout_postprocess=False,
++            with_layout_postprocess=with_layout_postprocess,
+             use_vertex_color=True,
+             stage1_inference_steps=None,
+             pointmap=pointmap,

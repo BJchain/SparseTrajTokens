@@ -1,0 +1,34 @@
+# ---- large artifacts: distributed separately (data / model release) ----
+/data/*
+!/data/README.md
+/checkpoints/*
+!/checkpoints/README.md
+/results/*
+!/results/README.md
+/baselines/preds/
+/baselines/qa/
+/baselines/logs/
+/baselines/extra/
+/paper/figure_assets/
+/paper/demo/videos/
+/paper/demo/posters/
+/paper/supplementary_demo.zip
+# upstream repositories (see third_party/README.md); our patches are tracked
+/third_party/*
+!/third_party/README.md
+!/third_party/patches/
+# internal Chinese working notes, kept locally only
+/docs/records/
+# outputs of the scripts
+/runs/
+/outputs/
+# python / editor
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+# empty dir created on import by a third-party module (cwd-relative)
+/visualization/

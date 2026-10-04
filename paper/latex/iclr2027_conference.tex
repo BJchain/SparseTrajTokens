@@ -1,0 +1,108 @@
+
+\documentclass{article} % For LaTeX2e
+\PassOptionsToPackage{table}{xcolor}
+\usepackage{iclr2027_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+% Vector macros used in the Method section that math_commands.tex does not define
+\providecommand{\vphi}{{\bm{\phi}}}
+\providecommand{\vDelta}{{\bm{\Delta}}}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amssymb}
+\usepackage{multirow}
+\usepackage{float}   % [H] placement for selected appendix examples
+
+\graphicspath{{figures/}}
+
+\title{Sparse Trajectory Tokens for Metric Motion Queries in Multimodal Language Models}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{Anonymous authors \\
+Paper under double-blind review
+}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+Video-language models can recognize motion yet struggle to answer questions about
+metric displacement and motion rate when scale and camera motion must be inferred from
+images. We study an interface that supplies an MLLM with externally reconstructed
+3D object and camera trajectories alongside video. Our representation associates
+sparse, part-aware keypoints with metric world-frame tracks, splits tracks at
+occlusions and motion events, and encodes adaptively fitted spline samples as
+trajectory tokens. A lightweight projector injects these tokens into
+Qwen3-VL-8B without modifying its vision encoder. We also construct TrajQA-B
+from Stereo4D tracks, with token-side answer checks and controls for text and
+option shortcuts. On its 7,500 four-choice numeric
+questions, the trajectory model obtains 82.2\% accuracy, versus 48.3\% for a
+separately fine-tuned frames-only reference without timestamps or guaranteed query frames. Replacing trajectories with those of another
+scene lowers accuracy to 29.6\%; the model's generated metric evidence also
+tracks the reference positions and motion quantities. These results show
+dependence on supplied trajectories for these QA tasks. Caption and QA training
+exclude the evaluation scenes; source-video separation for caption training
+has not been audited. The benchmark uses reconstructed rather than independently
+measured motion references.
+\end{abstract}
+
+\input{sections/introduction}
+
+\input{sections/related_work}
+
+\input{sections/method}
+
+\input{sections/experiments}
+
+\section{Conclusion}
+\label{sec:conclusion}
+Sparse Trajectory Tokens turn reconstructed tracks into compact metric records for an MLLM. TrajQA-B accuracy is 82.2\% with correct records and 29.6\% with donor records; a separate frames-only reference scores 48.3\%. Token-only accuracy is also 82.2\%, so frames add no measured benefit here. Endpoint questions cannot isolate tokenization components. Generalization to unseen source videos, component effects, and physical validity need a stage-1 source-video audit, matched visual inputs, ablations, and independent ground truth.
+
+\clearpage
+\subsection*{AI Use Statement}
+% Required by ICLR 2027; does not count toward the page limit.
+
+Generative AI tools were used solely for grammar correction and minor language polishing of text written by the authors. No generative AI tools were used for any research tasks requiring disclosure under the ICLR 2027 AI Policy. All AI-assisted edits were reviewed by the authors, who take full responsibility for the final content of this work.
+
+\subsection*{Reproducibility statement}
+The appendix describes the data source, QA split rule, curation gates, token
+fields, spline fitting, question generator, and trajectory-model schedules.
+Exact reproduction additionally requires the Stereo4D reconstructions,
+training and evaluation code, model checkpoints, the frames-only training
+recipe, and the donor-token mapping; the latter two are not documented in the
+available manuscript. Reported trained-model results use one seed.
+
+\subsection*{Ethics statement}
+The source videos may include identifiable people. Our analysis uses the
+Stereo4D reconstructions and selected illustrative frames; any redistribution
+of videos or derived visual assets should follow the source permissions and
+applicable privacy requirements. Automatic curation favors objects that can be
+segmented and tracked reliably, so the retained scenes should not be treated
+as a representative sample of all activities or environments.
+
+\bibliography{iclr2027_conference}
+\bibliographystyle{iclr2027_conference}
+
+\appendix
+\input{sections/appendix}
+
+
+\end{document}

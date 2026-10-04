@@ -1,0 +1,17 @@
+group,model,row_type,pred_file,protocol,weights_GiB,n_items,n_numeric3,numeric3,heldout,test,cam_disp,obj_disp,speed,non_num
+Proprietary Models,GPT-6 Astra,model,preds/Q1_GPT-6-Astra.jsonl,Q1,-,998,942,39.1720,37.9167,40.4762,45.9954,32.7206,33.9056,73.2143
+Proprietary Models,Claude Fable 5.1,model,preds/Q1_Claude-Fable-5.1.jsonl,Q1,-,1000,944,35.1695,35.8333,34.4828,39.5881,35.1648,26.9231,69.6429
+"Open-Source Base Models, 7-8B  (zero-shot)",Qwen2.5-VL-7B,model,preds/qwen25vl7b.jsonl,Q2,15.4,7922,7500,27.3200,26.5700,27.9131,27.0960,27.7164,27.2593,62.3223
+"Open-Source Base Models, 7-8B  (zero-shot)",Qwen3-VL-8B,model,preds/Qwen3-VL-8B.jsonl,Q2,16.3,7922,7500,28.0800,28.5326,27.7221,28.9490,27.8545,26.9155,64.2180
+"Open-Source Base Models, 7-8B  (zero-shot)",LLaVA-NeXT-Video-7B,model,preds/LLaVA-NeXT-Video-7B.jsonl,Q2,13.2,7922,7500,24.9867,24.5169,25.3582,25.6987,24.2173,24.6562,51.8957
+"Open-Source Base Models, 7-8B  (zero-shot)",InternVideo2.5-8B,model,preds/InternVideo2.5-8B.jsonl,Q2,15.0,7922,7500,25.4800,25.4529,25.5014,25.4860,24.9079,26.0806,57.5829
+"Open-Source Base Models, 7-8B  (zero-shot)",InternVL2.5-8B,model,preds/InternVL2.5-8B.jsonl,Q2,15.0,7922,7500,27.0400,27.2947,26.8386,27.7035,27.4401,25.5403,63.0332
+"Open-Source Base Models, 7-8B  (zero-shot)",InternVL3.5-8B,model,preds/InternVL3.5-8B.jsonl,Q2,15.9,7922,7500,26.7733,25.8454,27.5072,26.2758,26.4273,27.9470,62.0853
+"Open-Source Base Models, 32B  (zero-shot)",Qwen2.5-VL-32B,model,preds/Q1_Qwen2.5-VL-32B.jsonl,Q1,63.6,7922,7500,28.4267,28.2911,28.5339,29.7084,27.3481,27.5049,64.6919
+"Open-Source Base Models, 32B  (zero-shot)",Qwen3-VL-32B,model,preds/Q1_Qwen3-VL-32B.jsonl,Q1,62.1,7922,7500,27.7600,27.8382,27.6982,27.8858,25.9208,29.5187,66.3507
+"Open-Source Base Models, 38B  (zero-shot)",InternVL2.5-38B,model,preds/Q1_InternVL2.5-38B.jsonl,Q1,71.5,7922,7500,29.4267,29.3176,29.5129,30.3159,29.9263,27.4558,59.2417
+"Open-Source Base Models, 38B  (zero-shot)",InternVL3.5-38B,model,preds/Q1_InternVL3.5-38B.jsonl,Q1,71.5,7922,7500,28.5333,28.8647,28.2713,29.3742,27.5322,28.2417,60.4265
+3D Spatial Reasoning Models  (zero-shot),VG-LLM (Qwen2.5-VL-7B),model,preds/Q1_VG-LLM-8B.jsonl,Q1,17.2,7922,7500,25.2133,24.6075,25.6925,24.8177,25.4144,25.6385,57.8199
+3D Spatial Reasoning Models  (zero-shot),VLM-3R (LLaVA-Video-7B),model,preds/Q1_VLM-3R-7B.jsonl,Q1,17.4,7922,7500,26.9467,26.9324,26.9580,27.0656,27.0258,26.6699,55.4502
+4D Spatio-Temporal SFT Model  (NOT zero-shot: trained on Stereo4D QA; 85% of eval clips in its SFT data),MLLM-4D-SFT (Qwen3-VL-8B),model,preds/Q1_MLLM-4D-SFT-8B.jsonl,Q1,16.3,7922,7500,25.0267,24.7283,25.2627,25.3038,24.8619,24.7544,68.0095
+"Ours  (FINE-TUNED on TrajQA-B train, not zero-shot)",Ours: Traj+RGB (FT),model,preds/Ours_TrajRGB-final.jsonl,OURS,17.9,7922,7500,82.1600,81.7331,82.4976,89.4289,77.6243,75.2456,90.2844

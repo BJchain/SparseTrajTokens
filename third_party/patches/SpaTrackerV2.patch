@@ -1,0 +1,2547 @@
+diff --git a/models/SpaTrackV2/models/SpaTrack.py b/models/SpaTrackV2/models/SpaTrack.py
+index c5f43c0..1a3e209 100644
+--- a/models/SpaTrackV2/models/SpaTrack.py
++++ b/models/SpaTrackV2/models/SpaTrack.py
+@@ -615,14 +615,24 @@ class SpaTrack2(nn.Module, PyTorchModelHubMixin):
+                     # adjust the query with uncertainty
+                     if (full_point==False) and (overlap_d is None):
+                         pts_q_unc = sample_features5d(unc_metric[None], pts_q).squeeze()
+-                        pts_q = pts_q[:,:,pts_q_unc>0.5,:]
+-                        if (pts_q_unc<0.5).sum() > 0:
+-                            # pad the query points
+-                            pad_num = pts_q_unc.shape[0] - pts_q.shape[2]
+-                            # pick the random indices
+-                            indices = torch.randint(0, pts_q.shape[2], (pad_num,), device=pts_q.device)
+-                            pad_pts = indices
+-                            pts_q = torch.cat([pts_q, pts_q[:,:,pad_pts,:]], dim=-2)
++                        import os as _os
++                        if _os.environ.get("STV2_DBG"):
++                            print(f"[STV2_DBG] pts_q={tuple(pts_q.shape)} unc_q "
++                                  f"min/max/mean={float(pts_q_unc.min()):.3f}/{float(pts_q_unc.max()):.3f}/"
++                                  f"{float(pts_q_unc.mean()):.3f} kept={int((pts_q_unc>0.5).sum())} "
++                                  f"unc_metric={tuple(unc_metric.shape)} W_resize/W={W_resize}/{W}", flush=True)
++                        keep = pts_q_unc > 0.5
++                        # GUARD (local patch): if EVERY query is below the conf threshold, keeping none
++                        # -> pad from empty -> torch.randint(0,0) crash (DAVIS rallye/sheep/...). Tracking
++                        # low-conf queries beats dropping the whole scene, so keep all in that case.
++                        if int(keep.sum()) == 0:
++                            pass
++                        else:
++                            pts_q = pts_q[:,:,keep,:]
++                            if (pts_q_unc<0.5).sum() > 0:
++                                pad_num = pts_q_unc.shape[0] - pts_q.shape[2]
++                                indices = torch.randint(0, pts_q.shape[2], (pad_num,), device=pts_q.device)
++                                pts_q = torch.cat([pts_q, pts_q[:,:,indices,:]], dim=-2)
+ 
+                 support_pts_q = get_track_points(H_resize, W_resize,
+                                             T, x.device, query_size=self.track_num,
+diff --git a/models/SpaTrackV2/models/tracker3D/TrackRefiner.py b/models/SpaTrackV2/models/tracker3D/TrackRefiner.py
+index cb39db4..04a150f 100644
+--- a/models/SpaTrackV2/models/tracker3D/TrackRefiner.py
++++ b/models/SpaTrackV2/models/tracker3D/TrackRefiner.py
+@@ -1,6 +1,41 @@
+ import os, sys
+ import torch
+ import torch.amp
++# ── 跨文件依赖（按顺序对应论文 §3.2 / Fig. 3 SyncFormer + Joint Motion Optimization）──────
++#   CoTrackerThreeOffline                       —— ./co_tracker/cotracker_base.py
++#       SyncFormer 的 2D 分支基类（直接继承自 CoTracker3）。提供 fnet/updateformer/corr_mlp、
++#       get_track_feat / get_correlation_feat / interpolate_time_embed 等核心工具。
++#   get_1d_sincos_pos_embed_from_grid           —— ./co_tracker/cotracker_base.py
++#       1D sincos 位置编码（被时间维 token 用）。
++#   sample_features5d                           —— ../../utils/model_utils.py
++#       在 (B,T,C,H,W) 特征体上做 5D 网格采样（用于 query 像素 → 特征向量）。
++#   bilinear_sampler                            —— ../blocks.py
++#       2D 双线性采样（用于把 dense point map / unc_metric 在 query 像素处采样）。
++#   EfficientUpdateFormer / AttnBlock / Attention / CrossAttnBlock
++#                                                —— ./co_tracker/utils.py
++#       2D 分支的 Transformer 主体（含 virtual tokens、time/space block）。
++#   sequence_*_loss / balanced_binary_cross_entropy
++#                                                —— ./co_tracker/utils.py
++#       2D track / xyz track / visibility / dynamic / conf 的逐迭代加权 loss。
++#   Mlp / BasicEncoder / GeometryEncoder / NeighborTransformer / CorrPointformer
++#                                                —— ./co_tracker/utils.py
++#       MLP、卷积特征编码器 (fnet)、几何编码、邻域注意力、相关点 transformer。
++#   get_3d_sincos_pos_embed_from_grid           —— ../../utils/embeddings.py
++#       3D sincos 位置编码。
++#   EfficientUpdateFormer3D / weighted_procrustes_torch / posenc / key_fr_wprocrustes /
++#   get_topo_mask / TrackFusion / get_nth_visible_time_index
++#                                                —— ./spatrack_modules/utils.py
++#       3D 分支 Transformer 主体（论文 SyncFormer 的双分支核心）、weighted Procrustes 求解、
++#       拓扑/可见性 mask。
++#   extract_static_from_3DTracks / ba_pycolmap   —— ./spatrack_modules/ba.py
++#       从带 dynamic score 的 3D tracks 中筛选静态点；调用 pycolmap 做 BA。
++#   PointMapUpdator                              —— ./spatrack_modules/pointmap_updator.py
++#       视频 point map 的 scale/shift 在线更新。
++#   affine_invariant_global_loss                 —— ./spatrack_modules/alignment.py
++#       仿射不变的 depth/point map 全局对齐 loss。
++#   UpsampleTransformerAlibi                     —— ./delta_utils/upsample_transformer.py
++#       低分辨率残差 → 上采到原图尺寸（DELTA 风格 + ALiBi）。
++# ──────────────────────────────────────────────────────────────────────────────────────
+ from models.SpaTrackV2.models.tracker3D.co_tracker.cotracker_base import CoTrackerThreeOffline, get_1d_sincos_pos_embed_from_grid
+ import torch.nn.functional as F
+ from models.SpaTrackV2.utils.visualizer import Visualizer
+@@ -27,37 +62,62 @@ from models.SpaTrackV2.models.tracker3D.spatrack_modules.pointmap_updator import
+ from models.SpaTrackV2.models.tracker3D.spatrack_modules.alignment import affine_invariant_global_loss
+ from models.SpaTrackV2.models.tracker3D.delta_utils.upsample_transformer import UpsampleTransformerAlibi
+ 
++# ============================================================================
++# TrackRefiner3D —— 论文 §3.2 的 **SyncFormer**（后端）+ Joint Motion Optimization 全部实现。
++# 继承自 CoTrackerThreeOffline（2D 分支基类 = CoTracker3 离线版）。父类已经持有：
++#   self.fnet            : BasicEncoder（特征图编码器）
++#   self.updateformer    : EfficientUpdateFormer（2D 分支 Transformer）
++#   self.corr_mlp        : 把 7x7=49x49 的相关体压成 256d
++#   self.time_emb        : 1D sincos 位置编码（时间维）
++#   self.window_len / stride / corr_radius / corr_levels / hidden_dim / latent_dim
++# 在此基础上本类新增：
++#   self.updateformer3D  : EfficientUpdateFormer3D（3D 分支 Transformer，论文 SyncFormer 的另一路）
++#   self.fnet (3-ch)     : 输入 3 通道（point map）的卷积特征编码器（与父类 fnet 名字相同，被覆盖）
++#   self.corr_transformer: CorrPointformer，3D 相关体的邻域注意力
++#   self.corr3d_radius=3 : 3D 相关体的邻域半径
++#   一系列 Mlp：corr_depth/rel_pos/rel_pos_glob/corr_xyz/xyz/proj_xyz_embed
++# forward 每次迭代 (iters=4) 包含 §3.2 中的所有步骤：
++#   2D/3D 相关体构建 → SyncFormer 双分支更新 → cam_from_track（Procrustes + BA） → 深度替换
++# ============================================================================
+ class TrackRefiner3D(CoTrackerThreeOffline):
+ 
+     def __init__(self, args=None):
+         super().__init__(**args["base"])
+-        
++
+         """
+         This is 3D warpper from cotracker, which load the cotracker pretrain and
+         jointly refine the `camera pose`, `3D tracks`, `video depth`, `visibility` and `conf`
+         """
++        # 把父类的 2D EfficientUpdateFormer 升级为双分支 3D 版（论文 SyncFormer 的核心结构）。
++        # 它把 self.updateformer 作为 "EFormer" 参数引用进去，复用其 time_blocks / space_virtual_blocks / virual_tracks 等子模块。
+         self.updateformer3D = EfficientUpdateFormer3D(self.updateformer)
+-        self.corr_depth_mlp = Mlp(in_features=256, hidden_features=256, out_features=256)
+-        self.rel_pos_mlp = Mlp(in_features=75, hidden_features=128, out_features=128)
+-        self.rel_pos_glob_mlp = Mlp(in_features=75, hidden_features=128, out_features=256)
+-        self.corr_xyz_mlp = Mlp(in_features=256, hidden_features=128, out_features=128)
+-        self.xyz_mlp = Mlp(in_features=126, hidden_features=128, out_features=84)
++        # 下面这些 MLP 都是 3D 分支用的“相关体压缩 / 相对位置编码 / 升降维”工具：
++        self.corr_depth_mlp = Mlp(in_features=256, hidden_features=256, out_features=256)   # 3D 相关体 → 256d
++        self.rel_pos_mlp = Mlp(in_features=75, hidden_features=128, out_features=128)        # 相对位置 sin/cos(min0~max12, 3D) → 128d
++        self.rel_pos_glob_mlp = Mlp(in_features=75, hidden_features=128, out_features=256)   # 全局相对位置 → 256d
++        self.corr_xyz_mlp = Mlp(in_features=256, hidden_features=128, out_features=128)      # xyz 相关体压缩
++        self.xyz_mlp = Mlp(in_features=126, hidden_features=128, out_features=84)            # xyz 残差编码
+         # self.track_feat_mlp = Mlp(in_features=1110, hidden_features=128, out_features=128)
+-        self.proj_xyz_embed = Mlp(in_features=1210+50, hidden_features=1110, out_features=1110)
++        self.proj_xyz_embed = Mlp(in_features=1210+50, hidden_features=1110, out_features=1110)  # 3D embedding 投影到父类 input_dim=1110
+         # get the anchor point's embedding, and init the pts refiner
+         update_pts = True
+ 
++        # CorrPointformer (./co_tracker/utils.py)：对 3D 相关体的邻域做 cross-attention，
++        # 把 query 周围 K=16 个最近点的相对位置 + 特征压成单 token。论文中“3D Correlation”那一步。
+         self.corr_transformer = nn.ModuleList([
+             CorrPointformer(
+                 dim=128,
+                 num_heads=8,
+                 head_dim=128 // 8,
+                 mlp_ratio=4.0,
+-            )   
++            )
+         ]
+         )
+-        self.fnet = BasicEncoder(input_dim=3, 
++        # 用 3 通道（point map xyz）输入重建一个 BasicEncoder，覆盖父类的 RGB fnet
++        # —— 这就是论文中“3D correlation 在 normalized point maps 上计算”的卷积特征提取器。
++        self.fnet = BasicEncoder(input_dim=3,
+                                  output_dim=self.latent_dim, stride=self.stride)
++        # 3D 相关体邻域半径：与论文公式 (4) 中的 Δ=3 对应。
+         self.corr3d_radius = 3
+         
+         self.mode = args["mode"]
+@@ -85,6 +145,8 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+     def track_from_cam(self, queries, c2w_traj, intrs,
+                                 rgbs=None, visualize=False):
+         """
++        把 query 像素（带深度）按已知相机轨迹 c2w_traj 反投影到 world，再投影到所有帧
++        —— 用于初始化“纯静态点假设下”的轨迹。也就是 §3.2 中 T_ego（ego-motion induced tracks）。
+         This function will generate tracks by camera transform
+ 
+         Args:
+@@ -141,16 +203,20 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+                        init_pose=False,
+                        ):
+         """
++        ★ 论文 §3.2 "Camera Motion Optimization" 的入口函数 ★
++        把当前 SyncFormer 给出的 (2D track + 深度) → camera 系 3D 点 → world 系，
++        然后做两步联合优化：
++          ① key_fr_wprocrustes  : weighted Procrustes 粗对齐 cam→world（动态点用 dyn 分数下调权重）；
++          ② ba_pycolmap         : 从静态点抽 top-K 喂 pycolmap 做 differentiable BA 精细化相机位姿。
++        把刚体一致性约束注入 SyncFormer 的下一次迭代。
+         This function will generate tracks by camera transform
+ 
+         Args:
+-            queries: B T N 3
+-            scale_est: 1 1
+-            shift_est: 1 1
+-            intrs: B T 3 3
+-            dyn_prob: B T N
+-            metric_unc: B N 1
+-            query_pts: B T N 3
++            queries: B T N 3   —— 2D track (x,y) + depth z（实际是 self.coords_append）
++            intrs: B T 3 3     —— 当前估计的内参
++            dyn_prob: B T N    —— SyncFormer 输出的动态概率（>0.5 视为动态 → BA 时排除）
++            metric_unc: B N 1  —— 深度置信度
++            query_pts: B T N 3 —— query 点在 world 系下的位置（用于过滤离群静态点）
+         """
+         if tracks_xyz is not None:
+             B, T, N, _ = tracks.shape
+@@ -177,10 +243,13 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+         dyn_prob = dyn_prob.mean(dim=1)[..., None]
+         # B T N 3 -> local frames coordinates.  transformer  static points  B T N 3 -> B T N 3  static (B T N 3) -> same -> dynamic points @ C2T.inverse()
+         # get the cam pose
++        # graph_matrix[b, i, j, n] = vis(i,n) * vis(j,n) —— 共同可见的点对图；
++        # 给 weighted_procrustes 用，只在两帧都看得见的点上做对齐。
+         vis_est_ = vis_est[:,:,None,:]
+         graph_matrix = (vis_est_*vis_est_.permute(0, 2,1,3)).detach()
+         # find the max connected component
+         key_fr_idx = [0]
++        # 静态点权重 = 深度置信度 * (1 - dyn_prob)。dyn_prob 高的点（动态）权重接近 0。
+         weight_final = (metric_unc) # * vis_est
+ 
+ 
+@@ -207,12 +276,15 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+             else:
+ 
+                 if (not self.training):
++                    # 推理路径：先把当前 cam_pts 拉到 world（用上一次迭代的 c2w_est_curr），
++                    # 然后 key_fr_wprocrustes (./spatrack_modules/utils.py) 在关键帧之间求相对位姿增量，
++                    # 最后 ΔT @ c2w_curr 得到这次迭代的 c2w_init。
+                     # if (self.c2w_est_curr==torch.eye(4, device=cam_pts.device).repeat(B, T, 1, 1)).all():
+                     campts_update = torch.einsum("btij,btnj->btni", self.c2w_est_curr[...,:3,:3], cam_pts) + self.c2w_est_curr[...,None,:3,3]
+                     # campts_update = cam_pts
+                     c2w_traj_init_update = key_fr_wprocrustes(campts_update, graph_matrix,
+-                                                                (weight_final*(1-dyn_prob)).permute(0,2,1), vis_est_.permute(0,1,3,2)) 
+-                    c2w_traj_init = c2w_traj_init_update@self.c2w_est_curr                                   
++                                                                (weight_final*(1-dyn_prob)).permute(0,2,1), vis_est_.permute(0,1,3,2))
++                    c2w_traj_init = c2w_traj_init_update@self.c2w_est_curr
+                     # else:
+                         # c2w_traj_init = self.c2w_est_curr                # extract the stable static points for refine the camera pose
+                 else:
+@@ -229,16 +301,23 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+                 intrs_dn[...,0,:] *= self.factor_x
+                 intrs_dn[...,1,:] *= self.factor_y
+                 _, query_world_pts, _ = self.track_from_cam(query_pts, c2w_traj_init, intrs_dn)
+-                # refine the world tracks
+-                world_tracks_init = torch.einsum("btij,btnj->btni", c2w_traj_init[:,:,:3,:3], cam_pts) + c2w_traj_init[:,:,None,:3,3] 
++                # 用粗对齐后的 c2w 把 cam 系 3D 点搬到 world：world = R @ cam + t
++                world_tracks_init = torch.einsum("btij,btnj->btni", c2w_traj_init[:,:,:3,:3], cam_pts) + c2w_traj_init[:,:,None,:3,3]
++                # extract_static_from_3DTracks (./spatrack_modules/ba.py):
++                #   * 用 dyn_prob<0.5 过滤静态点；
++                #   * 再按 “与 query_world_pts 的距离” 取 top-K（训练 150 / 推理 1500）。
++                #   这些点近似于“真正不动 + 在多帧间稳定可见” → 喂 BA。
+                 world_tracks_static, mask_static, mask_topk, vis_mask_static, tracks2d_static = extract_static_from_3DTracks(world_tracks_init,
+                                                                                                             dyn_prob, query_world_pts,
+                                                                                                             vis_est, tracks, img_size=self.image_size,
+                                                                                                             K=150 if self.training else 1500)
+-                # calculate the efficient ba
++                # 取相同 mask 下的 cam 系点，并把 z 替换成 depth_unproj（来自 dense point map 的更精确深度）。
+                 cam_tracks_static = cam_pts[:,:,mask_static.squeeze(),:][:,:,mask_topk.squeeze(),:]
+                 cam_tracks_static[...,2] = depth_unproj.view(B, T, N)[:,:,mask_static.squeeze()][:,:,mask_topk.squeeze()]
+ 
++                # ba_pycolmap (./spatrack_modules/ba.py)：底层用 pycolmap 的 BundleAdjuster + ITERATIVE_SCHUR PCG，
++                # 用 reprojection 残差（+ 可选 depth 残差）优化所有帧的相机位姿与静态 3D 点。
++                # 输出：精修后的 c2w_traj_glob、world 系点云、内参。
+                 c2w_traj_glob, world_static_refine, intrs_refine = ba_pycolmap(world_tracks_static, intrs,
+                                                                                 c2w_traj_init, vis_mask_static,
+                                                                                 tracks2d_static, self.image_size,
+@@ -263,6 +342,9 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+         # xy_refine = torch.zeros_like(cam_pts_refine)[...,:2]
+         return c2w_traj_glob, cam_pts_refine, intrs_refine, xy_refine, world_tracks_init, world_tracks_refined, c2w_traj_init
+     
++    # ------------------------------------------------------------
++    # extract_img_feat / norm_xyz / denorm_xyz：3D 分支的特征提取与坐标归一化辅助
++    # ------------------------------------------------------------
+     def extract_img_feat(self, video, fmaps_chunk_size=200):
+         B, T, C, H, W = video.shape
+         dtype = video.dtype
+@@ -295,6 +377,9 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+ 
+     def norm_xyz(self, xyz):
+         """
++        把 xyz 用 (min_pts, max_pts) 归一到 [-1, 1]。
++        min_pts/max_pts 在 forward 中按 query 点 (mean ± 3σ) 估出，作为这一段视频的“归一化锚”。
++        正负归一化对 3D Transformer 输入分布稳定很关键（避免不同 scene 量纲差异）。
+         xyz can be (B T N 3) or (B T 3 H W) or (B N 3)
+         """
+         if xyz.ndim == 3:
+@@ -337,6 +422,19 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+                 max_pts = self.max_pts
+                 return (xyz + 1) / 2 * (max_pts - min_pts)[None,None,None,None,:] + min_pts[None,None,None,None,:] 
+ 
++    # ============================================================
++    # forward —— SyncFormer 的主流程（论文图 2 后端、图 3 SyncFormer、图 4 迭代示意）
++    # 输入：
++    #   video         : (B, T, 3, H, W)  原视频帧
++    #   metric_depth  : (B*T, 1, H_, W_) 前端 VGGT4Track 输出的 dense depth
++    #   metric_unc    : (B*T, 1, H_, W_) depth 置信度（>0.5 视为可信）
++    #   point_map     : (B*T, H_, W_, 3) 由 depth + intrs 反投影得到的 camera 系 3D 点云
++    #   queries       : (B, N, 3) 像素位置 + 0 (后续会被 sample_features5d 取真实 depth)
++    #   iters=4       : 迭代次数（论文图 4：Iteration 1/2/5，4~5 次时 reproj error 已饱和）
++    # 输出：
++    #   ret = { preds:2D track, vis_pred, conf_pred, cam_pred:c2w轨迹, loss }
++    #   dyn_prob*z_unc, coord_preds[-1], color_pts, intrs_org, point_map_refined, cache
++    # ============================================================
+     def forward(
+         self,
+         video,
+@@ -570,6 +668,8 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+             []
+         )
+ 
++        # ── 构造 4 个 level 的特征金字塔：fmaps(2D 卷积特征) + point_map(3D 点云特征) ──
++        # 论文公式 (4): Corr_3D 在 s=1,2,3,4 多尺度上算邻域相关；这里就是把 fmap/point_map 依次 ×0.5 下采样。
+         # We compute track features
+         fmaps_pyramid = []
+         point_map_pyramid = []
+@@ -710,8 +810,15 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+         residual_point = torch.zeros(B, T, 3, self.model_resolution[0]//self.stride,
+                                                          self.model_resolution[1]//self.stride, device=device)
+ 
++        # ★★★ SyncFormer 主循环 ★★★（论文 §3.2 / 图 4：iters 默认 4）
++        # 每次迭代里：
++        #   1) 在 4 个 corr_levels 上构造 2D 相关体 corr_emb 和 3D 相关体 corr_depth_emb；
++        #   2) 拼接 [vis, conf, corr, 相对位置编码] → 喂入 updateformer3D 双分支 Transformer；
++        #   3) 拿到 delta (Δxy, Δxyz, Δdyn, Δvis, Δconf) 与 scale/shift/dense 残差；
++        #   4) 调 cam_from_track 做 Procrustes + BA，把相机位姿更新写回；
++        #   5) 用 BA 后的 cam 投影回 2D 与 SyncFormer 的 2D 预测算 sync_loss（论文图 4 的“reprojection error 下降曲线”）。
+         for it in range(iters):
+-            # query points scale and shift
++            # 取出每个 query 点对应那帧的 scale/shift 估计（用于把 normalized depth 转回 metric）。
+             scale_est_query = torch.gather(scale_est, dim=1, index=queries[:,:,None,:1].long())
+             shift_est_query = torch.gather(shift_est, dim=1, index=queries[:,:,None,:1].long().repeat(1, 1, 1, 3))
+ 
+@@ -895,9 +1002,14 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+             x = x.view(B, N, T, -1)  # (B N) T D -> B N T D
+             x_depth = x_depth + self.interpolate_time_embed(x_depth, T)
+             x_depth = x_depth.view(B, N, T, -1)  # (B N) T D -> B N T D
++            # ★ 论文公式 (3) 的 f_sync：双分支 Transformer 同时输出 2D / 3D / dyn / vis 更新。
++            # EfficientUpdateFormer3D.forward (./spatrack_modules/utils.py) 内部：
++            #   * 2D 分支复用 self.updateformer（CoTracker3 原版） —— flow + vis_conf；
++            #   * 3D 分支独立 time_blocks_new + space_switcher_blocks + 与 2D 分支的 cross-attn；
++            #   * scale_shift / dense_res 是 stage 2 才会进的 “更新场景 scale-shift 与 dense 残差” 分支。
+             delta, delta_depth, delta_dynamic_prob, delta_pro_analysis_w, scale_shift_out, dense_res_out = self.updateformer3D(
+                 x,
+-                x_depth, 
++                x_depth,
+                 self.updateformer,
+                 add_space_attn=add_space_attn,
+                 extra_sparse_tokens=extra_sparse_tokens,
+@@ -1004,6 +1116,9 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+             coords_xyz_append_refine = coords_xyz_append.clone()
+             coords_xyz_append_refine[replace_mask] = coords_xyz_unproj[replace_mask]
+ 
++            # ★ 论文 §3.2 "Joint Motion Optimization" 的核心调用：
++            # 内部依次执行 weighted Procrustes（粗对齐） + ba_pycolmap（细化 BA）。
++            # 返回的 c2w_traj_est 会写到 self.c2w_est_curr，下一次迭代的 global pos embedding 用它。
+             c2w_traj_est, cam_pts_est, intrs_refine, coords_refine, world_tracks, world_tracks_refined, c2w_traj_init = self.cam_from_track(coords_append.clone(),
+                                                   intrs_org, dynamic_prob_curr, queries_z_unc, conf_est*vis_est*mask_out.float(),
+                                                   track_feat_concat=x_depth, tracks_xyz=coords_xyz_append_refine, init_pose=init_pose,
+@@ -1032,6 +1147,9 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+             coords_proj[...,:2] /= float(self.stride)
+             # make sure it is aligned with 2d tracking
+             coords_proj_curr = coords[...,:2].view(B*T, N, 2).detach()
++            # sync_loss：把 SyncFormer 的 2D 预测 (coords_proj_curr) 与 “3D 经相机投影” 得到的 2D (coords_proj) 拉一致。
++            # 这就是论文图 4 中迭代次数增加时 reprojection error 逐步下降的那个量；
++            # 作为自监督让 2D / 3D 两条分支保持一致（在缺少 GT 的真实数据上尤其重要）。
+             vis_est = (vis_est>0.5).float()
+             sync_loss += (vis_est.detach()[...,None]*(coords_proj_curr - coords_proj).norm(dim=-1, keepdim=True)*(1-mask_nan[...,None].float())).mean()
+             # coords_proj_curr[~mask_nan.view(B*T, N)] = coords_proj.view(B*T, N, 2)[~mask_nan.view(B*T, N)].to(coords_proj_curr.dtype)
+@@ -1171,6 +1289,8 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+                  "conf_pred": torch.sigmoid(confidence_preds[-1]),
+                 "cam_pred": self.c2w_est_curr,"loss": ret_loss}
+ 
++        # cache：在线滑窗推理时，跨段共享：当前段最后一帧的特征/3D 点 / 2D track，
++        # 让下一段的 query 直接拼上来（避免重复计算）。SpaTrack.forward_stream 在每个窗口结束后用 cache 接力。
+         cache = {
+             "fmaps": fmaps_org[0].detach(),
+             "track_feat_support3d_pyramid": [track_feat_support3d_pyramid[i].detach() for i in range(len(track_feat_support3d_pyramid))],
+@@ -1187,8 +1307,13 @@ class TrackRefiner3D(CoTrackerThreeOffline):
+         point_map_org_refined = point_map_org
+         return ret, torch.sigmoid(dynamic_prob_preds[-1])*queries_z_unc[:,None,:,0], coord_preds[-1], color_pts, intrs_org, point_map_org_refined, cache
+     
++    # ============================================================
++    # 训练 loss 辅助 —— 仅训练分支用到，推理路径不走这里
++    # ============================================================
+     def track_d2_loss(self, tracks3d, stride=[1,2,3], dyn_prob=None, mask=None):
+         """
++        track 二阶平滑 loss：对相邻帧二阶差分（加速度）做 L1，约束 3D track 在时间上平滑。
++        被 self.loss 调用，权重 r=0.8 衰减。
+         tracks3d: B T N 3
+         dyn_prob: B T N 1
+         """
+diff --git a/models/SpaTrackV2/models/tracker3D/co_tracker/cotracker_base.py b/models/SpaTrackV2/models/tracker3D/co_tracker/cotracker_base.py
+index 4aca4f3..5265280 100644
+--- a/models/SpaTrackV2/models/tracker3D/co_tracker/cotracker_base.py
++++ b/models/SpaTrackV2/models/tracker3D/co_tracker/cotracker_base.py
+@@ -4,6 +4,16 @@
+ # This source code is licensed under the license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++# ============================================================
++# CoTracker3 离线基类 —— 这是 SyncFormer (TrackRefiner3D) 的父类，提供 2D 分支的所有基础设施。
++# 跨文件依赖：
++#   ../../utils/model_utils.py
++#       sample_features5d  —— (B,T,C,H,W) 上 5D 网格采样（采 query 像素的特征）。
++#       bilinear_sampler   —— 2D 双线性采样。
++#   ./utils.py
++#       Mlp / BasicEncoder / EfficientUpdateFormer —— 2D 分支的 fnet + Transformer 主体。
++# 论文 §3.2 "For 2D embeddings, we keep the same to CoTracker3" 指的就是这里。
++# ============================================================
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -20,6 +30,10 @@ def get_1d_sincos_pos_embed_from_grid(
+     embed_dim: int, pos: torch.Tensor
+ ) -> torch.Tensor:
+     """
++    1D sin/cos 位置编码（base ω₀=10000，与原版 Transformer 一致）。
++    本类在 __init__ 中用它生成 self.time_emb (1, window_len, input_dim=1110)，
++    在 forward 中通过 interpolate_time_embed 把 time_emb 双线性插值到运行时的 T。
++    TrackRefiner3D 也用到（间接通过 self.interpolate_time_embed）。
+     This function generates a 1D positional embedding from a given grid using sine and cosine functions.
+ 
+     Args:
+@@ -66,6 +80,14 @@ def posenc(x, min_deg, max_deg):
+     return torch.cat([x] + [four_feat], dim=-1)
+ 
+ class CoTrackerThreeBase(nn.Module):
++    """
++    CoTracker3 的离线基类骨架：
++      * self.fnet (BasicEncoder)            —— RGB → 卷积特征 (B, T, latent_dim=128, H/4, W/4)。
++      * self.updateformer (EfficientUpdateFormer) —— 2D 分支 Transformer，输入 1110 维 embedding。
++      * self.corr_mlp (Mlp)                 —— 49x49 相关体 → 256 维。
++      * self.time_emb                       —— 1D sincos 时间位置编码（window_len, 1110）。
++    继承结构：CoTrackerThreeBase ← CoTrackerThreeOffline ← TrackRefiner3D (SyncFormer)。
++    """
+     def __init__(
+         self,
+         window_len=8,
+@@ -117,6 +139,12 @@ class CoTrackerThreeBase(nn.Module):
+             "time_emb", get_1d_sincos_pos_embed_from_grid(self.input_dim, time_grid[0])
+         )
+ 
++    # ------------------------------------------------------------
++    # get_support_points / get_track_feat / get_correlation_feat：
++    #   构造 query 周围 (2r+1) x (2r+1) 的支持点网格，并在 fmaps 上采样得到 “相关体”
++    #   —— 论文公式 (4) 中 Corr_3D 与 CoTracker3 原版 Corr_2D 都通过这个机制构造。
++    # interpolate_time_embed：把 8 帧的预训练 time_emb 拉伸到任意 T。
++    # ------------------------------------------------------------
+     def get_support_points(self, coords, r, reshape_back=True):
+         B, _, N, _ = coords.shape
+         device = coords.device
+@@ -185,6 +213,11 @@ class CoTrackerThreeBase(nn.Module):
+         return time_emb.to(previous_dtype)
+     
+ class CoTrackerThreeOffline(CoTrackerThreeBase):
++    """
++    CoTracker3 离线版（一次喂入全部 T 帧）。本仓库 SyncFormer 直接继承本类，
++    但 SyncFormer 重写了 forward —— 见 TrackRefiner3D.forward；
++    本类的 forward 主要保留作 “纯 2D tracker” 的参考路径。
++    """
+     def __init__(self, **args):
+         super(CoTrackerThreeOffline, self).__init__(**args)
+ 
+diff --git a/models/SpaTrackV2/models/tracker3D/co_tracker/utils.py b/models/SpaTrackV2/models/tracker3D/co_tracker/utils.py
+index 7287851..080c8a6 100644
+--- a/models/SpaTrackV2/models/tracker3D/co_tracker/utils.py
++++ b/models/SpaTrackV2/models/tracker3D/co_tracker/utils.py
+@@ -1,3 +1,17 @@
++# ============================================================
++# co_tracker/utils.py —— 后端 SyncFormer 的“2D 分支底层组件”集合。
++# 由 ../cotracker_base.py 和 ../../TrackRefiner.py / ../spatrack_modules/utils.py 三处共享：
++#   * fnet 用的 BasicEncoder（卷积特征金字塔）
++#   * 通用 Mlp / Attention / CrossAttnBlock / AttnBlock
++#   * EfficientUpdateFormer（CoTracker3 原版 Transformer，被 SyncFormer 复用作 2D 分支）
++#   * GeometryEncoder（3D 点云卷积编码器，备用）
++#   * NeighborTransformer / CorrPointformer（邻域 attention，用于 3D 相关体）
++#   * sequence_loss / sequence_loss_xyz / sequence_BCE_loss / sequence_prob_loss / sequence_dyn_prob_loss
++#     —— 每个迭代加权 (0.8^k) 的 sequence loss，被 TrackRefiner3D.loss 调用。
++# 跨文件依赖：
++#   ../../utils/model_utils.py::bilinear_sampler
++#   ../blocks.py::CrossAttnBlock as CrossAttnBlock_F（重命名导入避免与本文件 CrossAttnBlock 同名冲突）。
++# ============================================================
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -124,6 +138,11 @@ def reduce_masked_mean(input, mask, dim=None, keepdim=False):
+     return mean
+ 
+ class GeometryEncoder(nn.Module):
++    """
++    与 BasicEncoder 结构类似的卷积主干，但是 input_dim 可以是 3（point map）的另一变体。
++    SyncFormer 主路径用的是 BasicEncoder（在 TrackRefiner3D.__init__ 中 fnet=BasicEncoder(input_dim=3,...) ），
++    GeometryEncoder 保留作消融/可选实现。
++    """
+     def __init__(self, input_dim=3, output_dim=128, stride=4):
+         super(GeometryEncoder, self).__init__()
+         self.stride = stride
+@@ -192,6 +211,12 @@ class GeometryEncoder(nn.Module):
+         return x
+ 
+ class BasicEncoder(nn.Module):
++    """
++    SyncFormer 用的卷积特征编码器（CoTracker3 原版的 fnet）。
++    流程：Conv7x7+IN → ResBlock(stride=1) → ResBlock(stride=2) → ResBlock(stride=2) →
++         双线性插值统一到 stride=4 → concat → 1x1 Conv → 输出 (B, latent_dim=128, H/4, W/4)。
++    在 TrackRefiner3D.__init__ 中被实例化两次：父类用 input_dim=3 RGB 一次；本类自己再用 input_dim=3 point map 覆盖。
++    """
+     def __init__(self, input_dim=3, output_dim=128, stride=4):
+         super(BasicEncoder, self).__init__()
+         self.stride = stride
+@@ -332,6 +357,11 @@ class Mlp(nn.Module):
+ 
+ 
+ class Attention(nn.Module):
++    """
++    Multi-head attention，支持 cross-attention（context_dim 可不同），可走 Flash SDPA。
++    被本文件下方的 AttnBlock / CrossAttnBlock 包装使用，最终成为 EfficientUpdateFormer / EfficientUpdateFormer3D
++    的基础单元。
++    """
+     def __init__(
+         self, query_dim, context_dim=None, num_heads=8, dim_head=48, qkv_bias=False
+     ):
+@@ -393,6 +423,11 @@ class Attention(nn.Module):
+         return self.to_out(x)
+ 
+ class CrossAttnBlock(nn.Module):
++    """
++    Cross-Attention block：x ←(LN)→ Attention(query=x, context=context) → +x → MLP → +x。
++    EfficientUpdateFormer3D 中的 space_track3d2switcher / space_switcher2track3d / space_virtual2switcher 等
++    都是这个 block 的实例（论文图 3 中 2D ↔ 3D proxy token 的桥）。
++    """
+     def __init__(
+         self, hidden_size, context_dim, num_heads=1, mlp_ratio=4.0, **block_kwargs
+     ):
+@@ -438,6 +473,11 @@ class CrossAttnBlock(nn.Module):
+         return x
+ 
+ class AttnBlock(nn.Module):
++    """
++    Self-Attention block：x → LN → Attention → +x → MLP → +x。
++    EfficientUpdateFormer 的 time_blocks 与 space_virtual_blocks 都用它；
++    EfficientUpdateFormer3D 的 time_blocks_new / space_switcher_blocks 也用它。
++    """
+     def __init__(
+         self,
+         hidden_size,
+@@ -478,6 +518,19 @@ class AttnBlock(nn.Module):
+ 
+ class EfficientUpdateFormer(nn.Module):
+     """
++    ★ CoTracker3 原版的 “update transformer” ★
++    输入  : input_tensor (B, N, T, input_dim=1110)
++    输出  : flow  (B, N, T, output_dim)，可选 + vis_conf
++    机制  :
++      * input_transform     : Linear(1110 → hidden=384)。
++      * virtual_tokens (N_v=64)：可学习 “聚合 token”，每帧 attach 在 point tokens 后；
++      * time_blocks (×6)    : time dim 上的 self-attention（跨帧关联）。
++      * space_*_blocks      : space dim 上的 attn —— 让 virtual ↔ point 双向 cross-attn。
++      * flow_head / vis_conf_head : 最后 linear 解码。
++    在 SyncFormer (EfficientUpdateFormer3D) 中：
++      * 本类整体被复用作 “2D 分支”；
++      * 3D 分支新建对应的 time_blocks_new / switcher tokens / 一组 cross-attn block 与之并行；
++      * 二者通过 proxy token 双向 cross-attn（论文 SyncFormer 核心思想）。
+     Transformer model that updates track estimates.
+     """
+ 
+@@ -686,7 +739,11 @@ def sequence_loss(
+     z_unc=None,
+     mask_traj_gt=None
+ ):
+-    """Loss function defined over sequence of flow predictions"""
++    """
++    论文里 “0.8^(N-i-1) 权重对每次迭代加权 supervised” 的 2D track loss 实现。
++    被 TrackRefiner3D.loss 调用，对 coord_preds 这 4 次迭代的输出逐项算 L1。
++    Loss function defined over sequence of flow predictions
++    """
+     total_flow_loss = 0.0
+     for j in range(len(flow_gt)):
+         B, S, N, D = flow_gt[j].shape
+@@ -734,7 +791,11 @@ def sequence_loss_xyz(
+     loss_only_for_visible=False,
+     mask_traj_gt=None
+ ):
+-    """Loss function defined over sequence of flow predictions"""
++    """
++    与 sequence_loss 配对的 3D 版本：把 GT 2D + 深度通过内参反投影到相机系后，再与预测 3D 算 L2/Huber。
++    用于监督 3D 分支的输出 cam_pts_est / coords_xyz_preds。
++    Loss function defined over sequence of flow predictions
++    """
+     total_flow_loss = 0.0
+     for j in range(len(flow_gt)):
+         B, S, N, D = flow_gt[j].shape
+@@ -777,6 +838,8 @@ def huber_loss(x, y, delta=1.0):
+     return flag * 0.5 * diff**2 + (1 - flag) * delta * (abs_diff - 0.5 * delta)
+ 
+ 
++# 下面三个是 visibility / confidence / dynamic-prob 的逐迭代 BCE / focal 损失。
++# 同样按 iter 加权后汇总到 TrackRefiner3D.loss。
+ def sequence_BCE_loss(vis_preds, vis_gts, mask=None):
+     total_bce_loss = 0.0
+     for j in range(len(vis_preds)):
+@@ -876,6 +939,10 @@ def masked_mean_var(data: torch.Tensor, mask: torch.Tensor, dim: List[int]):
+     return mask_mean.squeeze(dim), mask_var.squeeze(dim)
+ 
+ class NeighborTransformer(nn.Module):
++    """
++    备用：两组点集互相 cross-attn 后各自聚合为 1 token，再求和。
++    SyncFormer 主路径未直接调用；保留作 3D 邻域聚合的备用实现。
++    """
+     def __init__(self, dim: int, num_heads: int, head_dim: int, mlp_ratio: float):
+         super().__init__()
+         self.dim = dim
+@@ -906,6 +973,15 @@ class NeighborTransformer(nn.Module):
+ 
+ 
+ class CorrPointformer(nn.Module):
++    """
++    ★ 论文公式 (4) “3D Correlation 的邻域聚合器” ★
++    输入：
++      query       (B*T*N, 1, 128)        ：当前点的查询特征。
++      target      (B*T*N, K, 128)        ：top-K 邻居的特征（K=16）。
++      target_rel_pos (B*T*N, K, 128)     ：邻居到 query 的相对位置编码（来自 posenc + rel_pos_mlp）。
++    输出：(B*T*N, 1, 2*dim)，由 TrackRefiner3D.corr_transformer[0] 调用，再过 corr_depth_mlp 压回 256d。
++    这是 SyncFormer 3D 分支构造 “correlation embedding” 的关键模块。
++    """
+     def __init__(self, dim: int, num_heads: int, head_dim: int, mlp_ratio: float):
+         super().__init__()
+         self.dim = dim
+diff --git a/models/SpaTrackV2/models/tracker3D/delta_utils/blocks.py b/models/SpaTrackV2/models/tracker3D/delta_utils/blocks.py
+index 029ade6..947e949 100644
+--- a/models/SpaTrackV2/models/tracker3D/delta_utils/blocks.py
++++ b/models/SpaTrackV2/models/tracker3D/delta_utils/blocks.py
+@@ -4,6 +4,15 @@
+ # This source code is licensed under the license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++# ============================================================
++# delta_utils/blocks.py —— DELTA 工程里的 building blocks 集合。
++# 仅被 ./upsample_transformer.py 通过：
++#   from .blocks import Attention, AttnBlock, BasicEncoder, CorrBlock, Mlp,
++#                       ResidualBlock, Upsample, cam2pix, pix2cam
++# 引入，给 SyncFormer 主路径的“可学习上采样”模块使用。
++# 跨文件依赖：../../blocks.py::bilinear_sampler 用于像素采样。
++# 这些组件与 ../co_tracker/utils.py 中的同名类各自独立（命名相同但实现略有差异）。
++# ============================================================
+ import collections
+ from functools import partial
+ from itertools import repeat
+diff --git a/models/SpaTrackV2/models/tracker3D/delta_utils/upsample_transformer.py b/models/SpaTrackV2/models/tracker3D/delta_utils/upsample_transformer.py
+index 8b2f0b4..e57ff83 100644
+--- a/models/SpaTrackV2/models/tracker3D/delta_utils/upsample_transformer.py
++++ b/models/SpaTrackV2/models/tracker3D/delta_utils/upsample_transformer.py
+@@ -1,3 +1,16 @@
++# ============================================================
++# UpsampleTransformer / UpsampleTransformerAlibi —— 来自 DELTA 论文的 “可学习上采样” 模块。
++# SyncFormer 在 stage 2 训练里调用：把低分辨率 dense 残差 (B,T,3,h,w) 用学习到的 softmax 卷积权重
++# 上采到原图分辨率（stride 4），相比双线性更能保边界与轨迹一致性。
++#
++# 调用关系：
++#   TrackRefiner3D 在每次迭代末尾（dense_res_out 非空时）调
++#     self.upsample_transformer(extra_dense_tokens.mean(dim=1), res_low) → up_mask
++#     再用 up_mask 通过 self.upsample_with_mask 把 res_low 卷积上采到 res_up。
++# 跨文件依赖：
++#   ./blocks.py 中的 Attention/AttnBlock/BasicEncoder/CorrBlock/Mlp/ResidualBlock/Upsample/cam2pix/pix2cam。
++#   ../../blocks.py::bilinear_sampler  —— 仅做工具采样。
++# ============================================================
+ import math
+ 
+ import numpy as np
+@@ -321,13 +334,20 @@ def get_alibi_slope(num_heads):
+ 
+ 
+ class UpsampleTransformerAlibi(nn.Module):
++    """
++    SyncFormer 主路径使用的上采样器（ALiBi 偏置代替可学习相对位置编码）：
++      * DecoderUpsampler 把 feat_map ×stride 上采（学习的卷积）；
++      * 然后用 (3x3 邻域 unfold + nearest 上采到目标分辨率) 构造 context；
++      * 与上采后的 feat 做 cross-attn（带 ALiBi 偏置），输出每个高分像素的 kernel² 权重；
++      * softmax → 这些权重就是 "卷积上采核"，被 TrackRefiner3D.upsample_with_mask 用来上采 res_low。
++    """
+     def __init__(
+-            self, 
+-            kernel_size: int = 3, 
+-            stride: int = 4, 
+-            latent_dim: int = 128, 
+-            n_heads: int = 4, 
+-            num_attn_blocks: int = 2, 
++            self,
++            kernel_size: int = 3,
++            stride: int = 4,
++            latent_dim: int = 128,
++            n_heads: int = 4,
++            num_attn_blocks: int = 2,
+             upsample_factor: int = 4,
+         ):
+         super().__init__()
+diff --git a/models/SpaTrackV2/models/tracker3D/spatrack_modules/alignment.py b/models/SpaTrackV2/models/tracker3D/spatrack_modules/alignment.py
+index 42a9f24..da1c1f3 100644
+--- a/models/SpaTrackV2/models/tracker3D/spatrack_modules/alignment.py
++++ b/models/SpaTrackV2/models/tracker3D/spatrack_modules/alignment.py
+@@ -1,3 +1,15 @@
++# ============================================================
++# Affine-invariant alignment 工具 —— 把预测 point map / depth 与 GT 在 (scale, shift) 自由度上对齐后求 L1。
++# 主要被以下两处用：
++#   1) ../TrackRefiner.py::TrackRefiner3D.forward (stage==2) —— 训练时把 dense point map 对齐到 GT。
++#   2) ../../vggt4track/utils/loss.py::compute_loss        —— 前端 VGGT4Track 训练的 depth 全局损失。
++# 实现思路 (MoGe 论文风格)：
++#   * mask_aware_nearest_resize 把点图降采样到 32x32 以加速对齐求解；
++#   * align_points_scale_z_shift / align_points_scale_xyz_shift：用最小二乘 / IRLS 解 (scale, shift)；
++#   * affine_invariant_global_loss：对齐后再用 normalized L1 + edge/normal 等子项作 loss。
++# 跨文件依赖：
++#   ./geometry_torch.py 提供 mask_aware_nearest_resize / weighted_mean / normalized_view_plane_uv 等几何工具。
++# ============================================================
+ from typing import *
+ import math
+ from collections import namedtuple
+@@ -10,8 +22,8 @@ import torch.types
+ import utils3d
+ 
+ from models.SpaTrackV2.models.tracker3D.spatrack_modules.geometry_torch import (
+-    weighted_mean, 
+-    harmonic_mean, 
++    weighted_mean,
++    harmonic_mean,
+     geometric_mean,
+     mask_aware_nearest_resize,
+     normalized_view_plane_uv,
+@@ -430,15 +442,24 @@ def _smooth(err: torch.FloatTensor, beta: float = 0.0) -> torch.FloatTensor:
+         return torch.where(err < beta, 0.5 * err.square() / beta, err - 0.5 * beta)
+ 
+ def affine_invariant_global_loss(
+-    pred_points: torch.Tensor, 
+-    gt_points: torch.Tensor, 
+-    mask: torch.Tensor, 
+-    align_resolution: int = 64, 
+-    beta: float = 0.0, 
+-    trunc: float = 1.0, 
++    pred_points: torch.Tensor,
++    gt_points: torch.Tensor,
++    mask: torch.Tensor,
++    align_resolution: int = 64,
++    beta: float = 0.0,
++    trunc: float = 1.0,
+     sparsity_aware: bool = False,
+     only_align: bool = False
+ ):
++    """
++    主流程：
++      1) mask_aware_nearest_resize → 把 (pred, gt) 降采到 32x32（仅在 mask 内）。
++      2) align_points_scale_z_shift → 在低分辨率上解 (scale, shift)。
++      3) 把 (scale, shift) 应用回原分辨率 pred。
++      4) only_align=True 时直接返回对齐后的 pred；
++         否则计算 weighted L1（按 GT depth 的倒数加权 → 远点权重小，近点权重大）。
++    被 ../TrackRefiner.py 和 ../../vggt4track/utils/loss.py 共同调用。
++    """
+     device = pred_points.device
+ 
+     # Align
+diff --git a/models/SpaTrackV2/models/tracker3D/spatrack_modules/ba.py b/models/SpaTrackV2/models/tracker3D/spatrack_modules/ba.py
+index 503ce93..d29d64c 100644
+--- a/models/SpaTrackV2/models/tracker3D/spatrack_modules/ba.py
++++ b/models/SpaTrackV2/models/tracker3D/spatrack_modules/ba.py
+@@ -1,3 +1,13 @@
++# ============================================================
++# Bundle Adjustment (BA) 模块 —— 论文 §3.2 "Camera Motion Optimization" 的精细化优化阶段。
++# 仅被 ../TrackRefiner.py 的 TrackRefiner3D.cam_from_track 在每次 SyncFormer 迭代中调用：
++#   先 extract_static_from_3DTracks 选出 top-K 静态点，
++#   再 ba_pycolmap 调用 pycolmap.create_default_bundle_adjuster + pyceres.solve 求解。
++# 依赖：
++#   pycolmap   —— COLMAP 的 Python 绑定（Reconstruction / Camera / Image / Point3D / Track）。
++#   pyceres    —— Google Ceres 求解器 Python 绑定（PCG + Schur complement + LM）。
++#   scipy.spatial.transform.Rotation —— 自定义 CostFunction 里 quat→matrix。
++# ============================================================
+ import pycolmap
+ import torch
+ import numpy as np
+@@ -12,11 +22,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
+ def extract_static_from_3DTracks(world_tracks, dyn_prob,
+                                      query_3d_pts, vis_est, tracks2d, img_size, K=100, maintain_invisb=False):
+     """
++    从 SyncFormer 输出的 3D tracks 中筛选“真正不动”的静态点喂给 BA：
++      ① 用 dyn_prob<0.5 滤掉动态点；
++      ② 在所有帧上对 visible 时刻的 world 坐标做加权平均得到“稳定 world 位置”；
++      ③ 再用 “query_3d_pts 与稳定位置的距离” 排序，取 top-K（训练 150 / 推理 1500）。
++    被 ../TrackRefiner.py::cam_from_track 调用。
+     world_tracks: B T N 3   this is the coarse 3d tracks in world coordinate  (coarse 3d tracks)
+     dyn_prob: B T N   this is the dynamic probability of the 3d tracks
+     query_3d_pts: B T N 3   this is the query 3d points in world coordinate (coarse by camera pose)
+     vis_est: B T N   this is the visibility of the 3d tracks
+-    tracks2d: B T N 2   this is the 2d tracks   
++    tracks2d: B T N 2   this is the 2d tracks
+     K: int   top K static points
+     """
+     B, T, N, _ = world_tracks.shape
+@@ -75,6 +90,13 @@ def log_ba_summary(summary):
+ #     return summary
+ 
+ def efficient_solver(solver_options, stability_mode=True):
++    """
++    设置 Ceres 求解器选项：
++      - ITERATIVE_SCHUR + SCHUR_JACOBI：经典 BA 配置（先消去 3D 点，再用 PCG 解相机块）。
++      - LEVENBERG_MARQUARDT：信赖域策略。
++      - num_threads=32：多线程。
++    stability_mode=True 时降低初始 trust region、放宽收敛阈值，避免训练时 ill-condition。
++    """
+     # Set linear solver to ITERATIVE_SCHUR (using PCG to solve Schur complement)
+     solver_options.linear_solver_type = LinearSolverType.ITERATIVE_SCHUR
+     
+@@ -137,6 +159,14 @@ def efficient_solver(solver_options, stability_mode=True):
+     return solver_options
+ 
+ class SpatTrackCost_static(pyceres.CostFunction):
++    """
++    自定义 Ceres CostFunction：用 dense depth 给 BA 加额外的 “深度残差” 约束。
++    residual = 20 * (z_cam - observed_depth) / observed_depth，
++    其中 z_cam = (R @ X + t)[2]。这是 SpaTrackerV2 在传统 reprojection 残差之外
++    引入的 “front-end depth 一致性” 约束，让 BA 不会漂走前端 dense depth。
++    （目前在 ba_pycolmap 中以 extra_residual 形式准备数据，但默认未启用 ceres 端的自定义残差，
++      被注释掉的 pyceres.add_spatrack_static_problem 是接入位置。）
++    """
+     def __init__(self, observed_depth):
+         """
+         observed_depth: float
+@@ -203,11 +233,16 @@ class SpatTrackCost_dynamic(pyceres.CostFunction):
+ def solve_bundle_adjustment(reconstruction, ba_options,
+                                 ba_config=None, extra_residual=None):
+     """
++    底层 BA 求解器（pycolmap 0.5+ API）：
++      1) pycolmap.create_default_bundle_adjuster 自动建好 problem（reprojection 残差 + Huber 等）。
++      2) efficient_solver 设置 Ceres solver options（PCG + Schur + LM + 多线程）。
++      3) pyceres.solve(...) 执行实际优化。
++    被本文件 ba_pycolmap 函数调用。
+     Perform bundle adjustment optimization (compatible with pycolmap 0.5+)
+-    
++
+     Args:
+         reconstruction: pycolmap.Reconstruction object
+-        ba_options: pycolmap.BundleAdjustmentOptions object 
++        ba_options: pycolmap.BundleAdjustmentOptions object
+         ba_config: pycolmap.BundleAdjustmentConfig object (optional)
+     """
+     # Alternatively, you can customize the existing problem or options as:
+@@ -263,6 +298,11 @@ def batch_matrix_to_pycolmap(
+     query_pts=None,
+ ):
+     """
++    把 batched torch 张量 → pycolmap.Reconstruction 对象：
++      - 每个 N 帧建一个 pycolmap.Camera + pycolmap.Image（带 cam_from_world 位姿）；
++      - 每个 P 个 3D 点建一个 reconstruction.points3D[id]；
++      - 2D 观测点用 Point2D(uv, point3D_id) 串到 Image.points2D 上。
++    track 至少需要 2 次 inlier 观测才会被加入（valid_idx）。
+     Convert Batched Pytorch Tensors to PyCOLMAP
+ 
+     Check https://github.com/colmap/pycolmap for more details about its format
+@@ -468,6 +508,17 @@ def pycolmap_to_batch_matrix(
+ 
+ def ba_pycolmap(world_tracks, intrs, c2w_traj, visb, tracks2d, image_size, cam_tracks_static=None, training=True, query_pts=None):
+     """
++    ★ 论文 §3.2 中 "bundle adjustment to optimize camera poses" 的实际入口 ★
++    被 ../TrackRefiner.py::TrackRefiner3D.cam_from_track 调用。
++    步骤：
++      1) batch_matrix_to_pycolmap：把 torch 张量装进 pycolmap.Reconstruction；
++      2) 配置 ba_options：refine_focal_length / refine_principal_point / refine_extra_params 都关掉
++         —— 仅细化相机外参（与 3D 点），保证 BA 只调位姿；
++      3) 固定第 0 帧位姿（参考帧）；3D 点可变 / 固定按 training 切换；
++      4) solve_bundle_adjustment 运行 Ceres；
++      5) pycolmap_to_batch_matrix：把优化结果转回 torch，更新 c2w_traj_glob / world_tracks。
++    全程 no_grad —— BA 本身不可微，但因为前端预测和 BA 残差由静态点构成，BA 后的结果再回到 SyncFormer
++    下一次迭代的输入 (global position embedding) 中，从而形成 “可微监督 + 不可微优化” 的混合 loop。
+     world_tracks: 1 1 K 3   this is the coarse 3d tracks in world coordinate  (coarse 3d tracks)
+     intrs: B T 3 3   this is the intrinsic matrix
+     c2w_traj: B T 4 4   this is the camera trajectory
+diff --git a/models/SpaTrackV2/models/tracker3D/spatrack_modules/blocks.py b/models/SpaTrackV2/models/tracker3D/spatrack_modules/blocks.py
+index e849ec9..2c0924c 100644
+--- a/models/SpaTrackV2/models/tracker3D/spatrack_modules/blocks.py
++++ b/models/SpaTrackV2/models/tracker3D/spatrack_modules/blocks.py
+@@ -1,3 +1,7 @@
++# ============================================================
++# 占位文件：PointDinoV2 仅声明骨架，没有真正实现 —— SyncFormer 主路径不导入它。
++# 保留是给将来 “DINOv2 for points” 的实验留接口。
++# ============================================================
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+diff --git a/models/SpaTrackV2/models/tracker3D/spatrack_modules/geometry_numpy.py b/models/SpaTrackV2/models/tracker3D/spatrack_modules/geometry_numpy.py
+index 8706437..f27c80b 100644
+--- a/models/SpaTrackV2/models/tracker3D/spatrack_modules/geometry_numpy.py
++++ b/models/SpaTrackV2/models/tracker3D/spatrack_modules/geometry_numpy.py
+@@ -1,3 +1,10 @@
++# ============================================================
++# 几何工具集（numpy 版）—— 与 ./geometry_torch.py 配套，提供求解 (focal, shift) 的最优化函数。
++# 主要被 ./geometry_torch.py 通过
++#     from .geometry_numpy import solve_optimal_focal_shift, solve_optimal_shift
++# 引入，用于 mask_aware_nearest_resize 之后的相机内参/位移粗求解。
++# 跨文件依赖：./tools.py::timeit。
++# ============================================================
+ from typing import *
+ from functools import partial
+ import math
+diff --git a/models/SpaTrackV2/models/tracker3D/spatrack_modules/geometry_torch.py b/models/SpaTrackV2/models/tracker3D/spatrack_modules/geometry_torch.py
+index 3536ab7..dbf046e 100644
+--- a/models/SpaTrackV2/models/tracker3D/spatrack_modules/geometry_torch.py
++++ b/models/SpaTrackV2/models/tracker3D/spatrack_modules/geometry_torch.py
+@@ -1,3 +1,12 @@
++# ============================================================
++# 几何工具集（torch 版）—— 被 ./alignment.py 与 ./pointmap_updator.py 调用。
++# 提供：
++#   weighted_mean / harmonic_mean / geometric_mean —— 带权统计；
++#   normalized_view_plane_uv                       —— 归一化 UV 网格（与 vggt4track 的 create_uv_grid 思路一致）；
++#   gaussian_blur_2d / mask_aware_nearest_resize   —— 几何降采 / 模糊；
++#   solve_optimal_focal_shift / solve_optimal_shift（来自 ./geometry_numpy.py）—— numpy 版焦距/平移解算。
++# 跨文件依赖：./tools.py::timeit；./geometry_numpy.py::solve_optimal_*。
++# ============================================================
+ from typing import *
+ import math
+ from collections import namedtuple
+diff --git a/models/SpaTrackV2/models/tracker3D/spatrack_modules/pointmap_updator.py b/models/SpaTrackV2/models/tracker3D/spatrack_modules/pointmap_updator.py
+index ab15fa7..453a85a 100644
+--- a/models/SpaTrackV2/models/tracker3D/spatrack_modules/pointmap_updator.py
++++ b/models/SpaTrackV2/models/tracker3D/spatrack_modules/pointmap_updator.py
+@@ -1,3 +1,11 @@
++# ============================================================
++# PointMapUpdator —— 在 SyncFormer 每次迭代后用 2D track + 重投影误差更新 dense point map 的
++# 全局 (scale, shift) 因子（实际上是论文公式 (1) 中的 a, b 的“后端微调”）。
++# 跨文件依赖：
++#   ../blocks.py::bilinear_sampler             —— 2D 双线性采样。
++#   ./alignment.py::align_points_scale*        —— 用最小二乘求 (scale, xyz_shift)。
++# 主路径默认未启用本类（TrackRefiner3D 没有直接实例化），保留作 stage-2 训练 / 实验用。
++# ============================================================
+ import torch
+ import torch.nn as nn
+ from models.SpaTrackV2.models.blocks import bilinear_sampler
+@@ -75,6 +83,11 @@ def compute_weighted_std(track2d, vis_est, eps=1e-6):
+     return std
+ 
+ class PointMapUpdator(nn.Module):
++    """
++    给定 SyncFormer 输出的 cam_pts_est 与 2D 重投影误差 reproj_loss，回退求一个
++    (scale, shift) 使得 point_map_org 与 cam_pts_est 一致 —— 用高斯权重(轨迹标准差)调权，
++    使长时间稳定且重投影误差小的点贡献更大。
++    """
+     def __init__(self, stablizer):
+         super(PointMapUpdator, self).__init__()
+         self.stablizer = stablizer()
+diff --git a/models/SpaTrackV2/models/tracker3D/spatrack_modules/simple_vit_1d.py b/models/SpaTrackV2/models/tracker3D/spatrack_modules/simple_vit_1d.py
+index 233f834..19cf255 100644
+--- a/models/SpaTrackV2/models/tracker3D/spatrack_modules/simple_vit_1d.py
++++ b/models/SpaTrackV2/models/tracker3D/spatrack_modules/simple_vit_1d.py
+@@ -1,3 +1,8 @@
++# ============================================================
++# 一个最简的 1D ViT 实现（来自 lucidrains/vit-pytorch）。
++# 在本仓库里只有 ./utils.py::TrackFusion → MyTransformerHead 用它的 Transformer + posemb_sincos_1d，
++# 用于备用 motion-basis 求解器。SyncFormer 主路径不调用本文件。
++# ============================================================
+ import torch
+ from torch import nn
+ 
+diff --git a/models/SpaTrackV2/models/tracker3D/spatrack_modules/tools.py b/models/SpaTrackV2/models/tracker3D/spatrack_modules/tools.py
+index 3687f69..7d473f2 100644
+--- a/models/SpaTrackV2/models/tracker3D/spatrack_modules/tools.py
++++ b/models/SpaTrackV2/models/tracker3D/spatrack_modules/tools.py
+@@ -1,3 +1,11 @@
++# ============================================================
++# 通用工具集合（无 SyncFormer 业务逻辑）。被 ./geometry_torch.py / ./geometry_numpy.py 引用：
++#   from .tools import timeit
++# 主要内容：
++#   timeit 上下文管理器（带 average 模式），catch_exception 装饰器，
++#   nested-dict 操作，jsonl I/O，多线程 batch 执行等。
++# 这些都是 MoGe / utils3d 等几何库的通用辅助，不直接参与论文算法。
++# ============================================================
+ from typing import *
+ import time
+ from pathlib import Path
+diff --git a/models/SpaTrackV2/models/tracker3D/spatrack_modules/utils.py b/models/SpaTrackV2/models/tracker3D/spatrack_modules/utils.py
+index 465c533..d50b94c 100644
+--- a/models/SpaTrackV2/models/tracker3D/spatrack_modules/utils.py
++++ b/models/SpaTrackV2/models/tracker3D/spatrack_modules/utils.py
+@@ -3,6 +3,15 @@ import torch
+ import torch.amp
+ import torch.nn.functional as F
+ import torch.nn as nn
++# ── 跨文件依赖 ──────────────────────────────────────────────────────
++#   ./co_tracker/utils.py
++#     EfficientUpdateFormer/AttnBlock/Attention/CrossAttnBlock —— 2D 分支 Transformer 与 attention 组件。
++#     EfficientUpdateFormer3D 内部直接挂上 self.updateformer (= EfficientUpdateFormer 实例) 来共享
++#     time_blocks / space_virtual_blocks / virual_tracks 等子模块（论文 SyncFormer 共享 2D backbone 的设计）。
++#     Mlp / BasicEncoder / GeometryEncoder / NeighborTransformer —— 通用工具。
++#   ./simple_vit_1d.py
++#     Transformer / posemb_sincos_1d —— TrackFusion 用的 1D ViT block + 1D sin/cos PE。
++# ───────────────────────────────────────────────────────────────────
+ from models.SpaTrackV2.models.tracker3D.co_tracker.utils import (
+     EfficientUpdateFormer, AttnBlock, Attention, CrossAttnBlock,
+     sequence_BCE_loss, sequence_loss, sequence_prob_loss, sequence_dyn_prob_loss
+@@ -68,6 +77,11 @@ def random_se3_transformation(
+ 
+ def weighted_procrustes_torch(X, Y, W=None, RT=None):
+     """
++    ★ 论文 §3.2 "weighted Procrustes analysis" 的 PyTorch 实现 ★
++    在每个时间步 t 上，求最优 (R_t, t_t) 使得  R_t · X + t_t ≈ Y_t，
++    权重 W 由 SyncFormer 输出的 dynamic 分数（1 - dyn_prob）调制 ——
++    动态点权重低 → 不参与对齐，从而只用静态点估相机运动。
++    返回每个 t 的 c2w 4×4 矩阵（注意末尾用 inverse 反过来，所以 w2c → c2w）。
+     Weighted Procrustes Analysis in PyTorch (batched).
+     
+     Args:
+@@ -134,9 +148,13 @@ def weighted_procrustes_torch(X, Y, W=None, RT=None):
+ 
+ def key_fr_wprocrustes(cam_pts, graph_matrix, dyn_weight, vis_mask,slide_len=16, overlap=8, K=3, mode="keyframe"):
+     """
++    在视频帧上做 weighted Procrustes 的“分段版”：
++      mode == "keyframe": 自动选 K 个关键帧（首+尾+按 graph_sum 贪心补），相邻关键帧之间分段对齐。
++      mode == "slide":    用 (slide_len, overlap) 滑窗，对每个窗内做局部对齐。
++    每段都调一次上面的 weighted_procrustes_torch。被 TrackRefiner3D.cam_from_track 调用。
+     cam_pts: (B, T, N, 3)
+-    graph_matrix: (B, 1, N)
+-    dyn_weight: (B, T, N)
++    graph_matrix: (B, T, T, N)  共视图（vis_i * vis_j）
++    dyn_weight: (B, T, N)        静态权重 (1 - dyn_prob) * conf
+     K: number of keyframes to select (including start and end)
+ 
+     Returns:
+@@ -227,7 +245,14 @@ def key_fr_wprocrustes(cam_pts, graph_matrix, dyn_weight, vis_mask,slide_len=16,
+     return c2w_traj_out
+ 
+ def posenc(x, min_deg, max_deg):
+-    """Cat x with a positional encoding of x with scales 2^[min_deg, max_deg-1].
++    """
++    谐波位置编码（NeRF 风格）：用 2^k 频率组的 sin/cos 把标量/向量映射到高维。
++    被 TrackRefiner3D.forward 用于：
++      * rel_pos_emb_input  (2D 相对位置, min=0 max=10 → 1×84 dim)
++      * rel_xyz_emb_input  (3D 相对位置, min=0 max=10 → 1×126 dim)
++      * rel_pos_query_glob (全局相对位置 + conf + dyn, min=0 max=12 → 75 dim)
++      * 公式 (4) 中 “harmonic positional encoding to project relative translations to high-d”
++    Cat x with a positional encoding of x with scales 2^[min_deg, max_deg-1].
+     Instead of computing [sin(x), cos(x)], we use the trig identity
+     cos(x) = sin(x + pi/2) and do one vectorized call to sin([x, x+pi/2]).
+     Args:
+@@ -251,6 +276,17 @@ def posenc(x, min_deg, max_deg):
+ 
+ class EfficientUpdateFormer3D(nn.Module):
+     """
++    ★★★ 论文 §3.2 / Fig. 3 的 SyncFormer 主体 ★★★
++    双分支结构：
++      * 2D 分支：直接复用 EFormer（= CoTrackerThreeBase.updateformer 这个 EfficientUpdateFormer 实例）
++                 的 time_blocks / space_virtual_blocks / space_(point↔virtual) blocks / flow_head / vis_conf_head。
++      * 3D 分支：新建 time_blocks_new + space_track3d2switcher_blocks + space_switcher2track3d_blocks +
++                 space_(virtual↔switcher)_blocks + space_switcher_blocks + point_head/depth_head。
++      * 桥梁：switcher_tokens（"proxy tokens"）—— 2D virtual tokens 与 3D track3d tokens 通过它互相 cross-attn，
++        正好对应论文图 3 中的 "Cross Attention / 2D-3D Proxy tokens" 设计。
++    可选输出：
++      * scale_shift_out / dense_res_out —— 只有 stage==2 训练时才进的“dense 残差 + scale/shift 更新”分支，
++        和 TrackRefiner3D 的 self.scale_shift_tokens / self.residual_embedding / upsample_transformer 一起工作。
+     Transformer model that updates track in 3D
+     """
+ 
+@@ -266,8 +302,10 @@ class EfficientUpdateFormer3D(nn.Module):
+         num_heads = EFormer.num_heads
+         mlp_ratio = 4.0
+  
+-        #NOTE: we design a switcher to bridege the camera pose, 3d tracks and 2d tracks 
++        #NOTE: we design a switcher to bridege the camera pose, 3d tracks and 2d tracks
++        # ↑↑ 这就是论文 SyncFormer 中的 “proxy tokens”：2D virtual tokens 与 3D track 之间的中间转译。
+ 
++        # 3D 分支自己的 “虚拟轨迹” token；与 2D 的 EFormer.virual_tracks 一一对应。
+         # iteract with pretrained 2d tracking
+         self.switcher_tokens = nn.Parameter(
+             torch.randn(1, num_virtual_tracks, 1, hidden_size)
+@@ -413,10 +451,13 @@ class EfficientUpdateFormer3D(nn.Module):
+         
+     def forward(self, input_tensor, input_tensor3d, EFormer: EfficientUpdateFormer,
+                         mask=None, add_space_attn=True, extra_sparse_tokens=None, extra_dense_tokens=None):
+-        
++
++        # input_tensor   : 2D embeddings (B*N, T, 1110) —— 来自 TrackRefiner.forward 的 x
++        # input_tensor3d : 3D embeddings (B*N, T, 1110) —— 来自 TrackRefiner.forward 的 x_depth
++        # 注意：2D 和 3D 都过 EFormer.input_transform 这个 Linear 投影 (1110 → hidden_size=384)。
+         #NOTE: prepare the pose and 3d tracks features
+         tokens3d = EFormer.input_transform(input_tensor3d)
+-        
++
+         tokens = EFormer.input_transform(input_tensor)
+         B, _, T, _ = tokens.shape
+         virtual_tokens = EFormer.virual_tracks.repeat(B, 1, T, 1)
+@@ -446,11 +487,11 @@ class EfficientUpdateFormer3D(nn.Module):
+                 extra_dense_tokens = self.dense_res_self_attn[i](extra_dense_tokens)
+                 extra_dense_tokens = rearrange(extra_dense_tokens, '(b h w) t c -> b t c h w', b=B, h=h_p, w=w_p)
+             
+-            # temporal
++            # ── 2D 分支：时间 attention（复用预训练 CoTracker3 的 time_blocks）──
+             time_tokens = tokens.contiguous().view(B * N, T, -1)  # B N T C -> (B N) T C
+             time_tokens = EFormer.time_blocks[i](time_tokens)
+ 
+-            # temporal 3d
++            # ── 3D 分支：自己的时间 attention（time_blocks_new，论文 SyncFormer 新增的 3D 分支）──
+             time_tokens3d = tokens3d.contiguous().view(B * N, T, -1)  # B N T C -> (B N) T C
+             time_tokens3d = self.time_blocks_new[i](time_tokens3d)
+ 
+@@ -475,17 +516,19 @@ class EfficientUpdateFormer3D(nn.Module):
+                 track3d_tokens = space_tokens3d[:, : N - EFormer.num_virtual_tracks]
+                 switcher_tokens = space_tokens[:, N - EFormer.num_virtual_tracks + 1:]
+ 
+-                # iteract switcher with pose and tracks3d
++                # ★ 论文图 3 的 "Cross Attention / Proxy tokens" 双向桥接 ★
++                # ① 3D track → switcher（让 switcher 编码 3D 信息）
+                 switcher_tokens = self.space_track3d2switcher_blocks[j](
+                     switcher_tokens, track3d_tokens, mask=mask
+                 )
+ 
+-                
++
++                # ② 2D virtual ← 2D points（CoTracker3 原有的 space attention）
+                 virtual_tokens = EFormer.space_virtual2point_blocks[j](
+                     virtual_tokens, point_tokens, mask=mask
+                 )
+ 
+-                # get the switcher_tokens
++                # ③ switcher ← virtual（让 switcher 也带上 2D 信息）—— 2D/3D 在 proxy token 上汇合
+                 switcher_tokens = self.space_virtual2switcher_blocks[j](
+                     switcher_tokens, virtual_tokens
+                 )
+@@ -527,11 +570,15 @@ class EfficientUpdateFormer3D(nn.Module):
+         tokens = tokens[:, : N - EFormer.num_virtual_tracks]
+         track3d_tokens = tokens3d[:, : N - EFormer.num_virtual_tracks]
+ 
++        # ── 解码 ──
++        # 3D 分支：point_head 输出 4 维 → [Δxyz (3), Δdyn_prob (1)]（论文里的 T^3d_{k+1}, p^dyn_{k+1}）。
+         if self.update_points:
+-            depth_update, dynamic_prob_update = self.point_head(track3d_tokens)[..., :3], self.point_head(track3d_tokens)[..., 3:] 
++            depth_update, dynamic_prob_update = self.point_head(track3d_tokens)[..., :3], self.point_head(track3d_tokens)[..., 3:]
+         else:
+-            depth_update, dynamic_prob_update = self.depth_head(track3d_tokens)[..., :1], self.depth_head(track3d_tokens)[..., 1:] 
++            depth_update, dynamic_prob_update = self.depth_head(track3d_tokens)[..., :1], self.depth_head(track3d_tokens)[..., 1:]
++        # pro_analysis_w：BA 时点的“可信度”加权（最终与 dynamic_prob 一起决定该点是否进 BA）。
+         pro_analysis_w = self.pro_analysis_w_head(track3d_tokens)
++        # 2D 分支：flow_head 输出 (Δx, Δy, ...)；如果 vis_conf 单独 head，则再拼上 (vis, conf) 两通道。
+         flow = EFormer.flow_head(tokens)
+         if EFormer.linear_layer_for_vis_conf:
+             vis_conf = EFormer.vis_conf_head(tokens)
+@@ -543,6 +590,12 @@ class EfficientUpdateFormer3D(nn.Module):
+         else:
+             return flow, depth_update, dynamic_prob_update, pro_analysis_w, None, None
+ 
++# ============================================================
++# 下面 recover_global_translations_batch + global_graph_motion_average 是“图运动平均”
++# 的另一种相机位姿一致化方案（在所有 (i,j) 帧对之间用相对位姿求全局解）。
++# 当前 TrackRefiner3D.cam_from_track 走的是 weighted Procrustes + pycolmap BA 这条主线，
++# 这两个函数主要保留给消融实验 / 备用路径用。
++# ============================================================
+ def recover_global_translations_batch(global_rot, c2w_traj, graph_weight):
+     B, T = global_rot.shape[:2]
+     device = global_rot.device
+@@ -673,6 +726,9 @@ def global_graph_motion_average(c2w_traj, graph_weight):
+ def depth_to_points_colmap(metric_depth: torch.Tensor,
+                            intrinsics: torch.Tensor) -> torch.Tensor:
+     """
++    ★ 主路径反投影函数：dense depth + intrinsics → camera 系下的 point map (B, H, W, 3) ★
++    被 vggt4track/models/vggt_moe.py::VGGT4Track.forward 和 vggt4track/utils/loss.py 共同调用，
++    保证前端 / 后端 / 训练 loss 使用同一个数值约定（COLMAP 风格：像素 (u,v) 对应内参 [[fx,0,cx],[0,fy,cy],[0,0,1]]）。
+     Unproject a depth map to a point cloud in COLMAP convention.
+ 
+     Args:
+@@ -775,6 +831,11 @@ def positionalEncoding_vec(in_tensor, b):
+     output = mapped_coords.transpose(2, 1).contiguous().view(mapped_coords.size(0), -1)
+     return output
+ 
++# ============================================================
++# TrackFusion —— 备用模型：用一组 motion basis B (3xK) + 每点系数把 2D tracks 重建为 3D 轨迹，
++# 并联合预测相机位姿。在 TrackRefiner3D 主路径不被直接调用，作为 “外部 motion-basis 求解器” 接入。
++# 这里的 MyTransformerHead 用了 ./simple_vit_1d.py 的 Transformer + posemb_sincos_1d。
++# ============================================================
+ class TrackFusion(nn.Module):
+     def __init__(self,width1=320,conv2_kernel_size=31,K=12,
+                                     conv_kernel_size=3,inputdim=2,use_positionl_encoding=True,
+@@ -919,6 +980,9 @@ class TrackFusion(nn.Module):
+ 
+ def get_nth_visible_time_index(vis_gt: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+     """
++    在训练时给定每个 query point 的“第 n 次可见时刻”作为新的起点：
++    随机抽取 n ∈ [1, sum(vis)]，把 query 设到对应帧的 GT 像素坐标 —— 数据增强 / 随机 first-positive。
++    被 TrackRefiner.forward 和 SpaTrack.forward_stream 共同调用。
+     vis_gt: [B, T, N]  0/1 binary tensor
+     n: [B, N] int tensor, the n-th visible time index to get (1-based)
+     Returns: [B, N] tensor of time indices into T, or -1 if not enough visible steps
+@@ -970,6 +1034,10 @@ def knn_torch(x, k):
+ def get_topo_mask(coords_xyz_append: torch.Tensor,
+                                  coords_2d_lift: torch.Tensor, replace_ratio: float = 0.6) -> torch.Tensor:
+     """
++    拓扑一致性掩码：用 kNN 邻域内 “raw depth 与 unproject depth 的相对差” 判断点是否被深度跳变破坏。
++    如果一个点和它的 k 邻居在 raw 与 unproject 之间保持几乎相同的相对关系（拓扑稳定），它的 mask=1。
++    TrackRefiner.forward 中 “way2: top k topological change detection”（被注释掉的备选方案）调用此函数；
++    主路径用的是更便宜的 “way1: depth 二阶差分 jitter mask”。
+     coords_xyz_append: [B, T, N, 3] 3d coordinates
+     coords_2d_lift: [B*T, N] depth map
+     replace_ratio: float, the ratio of the depth change to be considered as a topological change
+diff --git a/models/SpaTrackV2/models/vggt4track/heads/camera_head.py b/models/SpaTrackV2/models/vggt4track/heads/camera_head.py
+index d9a4891..e5c2b9d 100644
+--- a/models/SpaTrackV2/models/vggt4track/heads/camera_head.py
++++ b/models/SpaTrackV2/models/vggt4track/heads/camera_head.py
+@@ -11,6 +11,12 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
++# ── 跨文件依赖 ────────────────────────────────────────────────────
++#   Mlp           —— ../layers/__init__.py → ../layers/mlp.py    (两层 Linear+GELU)
++#   Block         —— ../layers/block.py                          (Transformer block)
++#   activate_pose —— ./head_act.py
++#       把 9D 编码 [T(3), quat(4), FoV(2)] 分别激活（这里都用 "linear" 加少量 ReLU on FoV）。
++# ─────────────────────────────────────────────────────────────────
+ from models.SpaTrackV2.models.vggt4track.layers import Mlp
+ from models.SpaTrackV2.models.vggt4track.layers.block import Block
+ from models.SpaTrackV2.models.vggt4track.heads.head_act import activate_pose
+@@ -18,9 +24,12 @@ from models.SpaTrackV2.models.vggt4track.heads.head_act import activate_pose
+ 
+ class CameraHead(nn.Module):
+     """
+-    CameraHead predicts camera parameters from token representations using iterative refinement.
+-
+-    It applies a series of transformer blocks (the "trunk") to dedicated camera tokens.
++    论文 §3.1 中的 **Neural Camera Tracker / Pose Head**。
++    输入: aggregated_tokens_list（来自 Aggregator）的最后一层；只取 camera_token (index 0)。
++    输出: 长度为 num_iterations 的 list，每项 (B, S, 9) = [T(3), quat(4), FoV_h, FoV_w]。
++    迭代细化方式：参考 VGGSfM/VGGT/RAFT 的 RAFT 风格 —— 把上一轮的预测 embed 进 adaLN
++    调制本轮的 token，再过 trunk transformer 输出 delta，叠加得到本轮预测。
++    多次迭代后用 0.8^(N-i-1) 权重做训练监督（见 ../utils/loss.py: ln_pose）。
+     """
+ 
+     def __init__(
+@@ -37,6 +46,7 @@ class CameraHead(nn.Module):
+     ):
+         super().__init__()
+ 
++        # target_dim=9：[T_x, T_y, T_z, q_x, q_y, q_z, q_w, fov_h, fov_w]
+         if pose_encoding_type == "absT_quaR_FoV":
+             self.target_dim = 9
+         else:
+@@ -47,7 +57,8 @@ class CameraHead(nn.Module):
+         self.fl_act = fl_act
+         self.trunk_depth = trunk_depth
+ 
+-        # Build the trunk using a sequence of transformer blocks.
++        # trunk：4 层标准 Transformer Block（注意 dim_in=2*embed_dim=2048）。
++        # 这里只对 (B, S=1, dim_in) 的 pose token 做 self-attention，对应论文图 2 的 Pose Tokens。
+         self.trunk = nn.Sequential(
+             *[
+                 Block(
+@@ -60,19 +71,23 @@ class CameraHead(nn.Module):
+             ]
+         )
+ 
+-        # Normalizations for camera token and trunk output.
++        # token_norm: 进入 trunk 前对 aggregator camera token 的 LN。
++        # trunk_norm: 出 trunk 后再 LN，再喂 pose_branch。
+         self.token_norm = nn.LayerNorm(dim_in)
+         self.trunk_norm = nn.LayerNorm(dim_in)
+ 
+-        # Learnable empty camera pose token.
++        # 学习到的“空位姿” token —— 用作第一次迭代的“初值”。
+         self.empty_pose_tokens = nn.Parameter(torch.zeros(1, 1, self.target_dim))
++        # 把 9D 编码（初值或上一轮预测）embed 到 dim_in，用于 adaLN 调制。
+         self.embed_pose = nn.Linear(self.target_dim, dim_in)
+ 
+-        # Module for producing modulation parameters: shift, scale, and a gate.
++        # adaLN-Zero（DiT 风格）：根据 pose embedding 生成 (shift, scale, gate) 三组参数。
++        # poseLN_modulation 输出维度 3*dim_in，chunk 成 shift/scale/gate。
+         self.poseLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim_in, 3 * dim_in, bias=True))
+ 
+-        # Adaptive layer normalization without affine parameters.
++        # adaln_norm: elementwise_affine=False —— 仅做归一化，shift/scale 由 poseLN_modulation 给。
+         self.adaln_norm = nn.LayerNorm(dim_in, elementwise_affine=False, eps=1e-6)
++        # pose_branch: 把 trunk 输出 (dim_in) 映射到 9D delta。
+         self.pose_branch = Mlp(
+             in_features=dim_in,
+             hidden_features=dim_in // 2,
+@@ -92,13 +107,15 @@ class CameraHead(nn.Module):
+         Returns:
+             list: A list of predicted camera encodings (post-activation) from each iteration.
+         """
+-        # Use tokens from the last block for camera prediction.
++        # 只用 aggregator 最后一层输出（最深的语义特征）。
+         tokens = aggregated_tokens_list[-1]
+ 
+-        # Extract the camera tokens
++        # 取 P 维上的索引 0，也就是 camera_token（见 aggregator.py 的拼接顺序：camera|register|patch）。
++        # 形状: (B, S, dim_in)
+         pose_tokens = tokens[:, :, 0]
+         pose_tokens = self.token_norm(pose_tokens)
+ 
++        # 进入迭代细化；返回每轮激活后的 pose encoding 列表。
+         pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations)
+         return pred_pose_enc_list
+ 
+@@ -113,36 +130,40 @@ class CameraHead(nn.Module):
+         Returns:
+             list: List of activated camera encodings from each iteration.
+         """
+-        B, S, C = pose_tokens.shape  # S is expected to be 1.
++        # 注意：这里 "S" 是 sequence length（每帧 1 个 camera_token），不是 1。
++        # 实际形状 (B, T_frames, dim_in)，trunk 在 T 维上做 self-attention（跨帧位姿耦合）。
++        B, S, C = pose_tokens.shape
+         pred_pose_enc = None
+         pred_pose_enc_list = []
+ 
+         for _ in range(num_iterations):
+-            # Use a learned empty pose for the first iteration.
++            # ① 取得当前迭代输入：第一次用学习到的 empty pose，之后用上一轮预测（detach 切断梯度回传）。
+             if pred_pose_enc is None:
+                 module_input = self.embed_pose(self.empty_pose_tokens.expand(B, S, -1))
+             else:
+-                # Detach the previous prediction to avoid backprop through time.
+-                pred_pose_enc = pred_pose_enc.detach()
++                pred_pose_enc = pred_pose_enc.detach()  # 避免 backprop through time
+                 module_input = self.embed_pose(pred_pose_enc)
+ 
+-            # Generate modulation parameters and split them into shift, scale, and gate components.
++            # ② adaLN-Zero：从位姿 embedding 生成调制 (shift, scale, gate)。
+             shift_msa, scale_msa, gate_msa = self.poseLN_modulation(module_input).chunk(3, dim=-1)
+ 
+-            # Adaptive layer normalization and modulation.
++            # ③ 用调制参数对 pose_tokens 做仿射变换，再加回残差（Zero-init 的 gate 让训练初期接近恒等映射）。
+             pose_tokens_modulated = gate_msa * modulate(self.adaln_norm(pose_tokens), shift_msa, scale_msa)
+             pose_tokens_modulated = pose_tokens_modulated + pose_tokens
+ 
++            # ④ 跨帧 Transformer trunk（4 层 Block）。
+             pose_tokens_modulated = self.trunk(pose_tokens_modulated)
+-            # Compute the delta update for the pose encoding.
++            # ⑤ 解码出当前迭代的 9D 增量。
+             pred_pose_enc_delta = self.pose_branch(self.trunk_norm(pose_tokens_modulated))
+ 
++            # ⑥ 累加：pred_{k+1} = pred_k + delta_k（RAFT 风格）。
+             if pred_pose_enc is None:
+                 pred_pose_enc = pred_pose_enc_delta
+             else:
+                 pred_pose_enc = pred_pose_enc + pred_pose_enc_delta
+ 
+-            # Apply final activation functions for translation, quaternion, and field-of-view.
++            # ⑦ activate_pose (./head_act.py)：分别对 T / quat / FoV 做激活。
++            # 这里 trans_act/quat_act 都 "linear"，fl_act="relu" 保证焦距/FoV 正值。
+             activated_pose = activate_pose(
+                 pred_pose_enc,
+                 trans_act=self.trans_act,
+@@ -156,7 +177,8 @@ class CameraHead(nn.Module):
+ 
+ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+     """
+-    Modulate the input tensor using scaling and shifting parameters.
++    AdaLN 仿射调制：x ← x * (1+scale) + shift
++    DiT 论文里的写法（(1+scale) 而非 scale 是为了让初始 scale=0 时退化为恒等）。
+     """
+     # modified from https://github.com/facebookresearch/DiT/blob/796c29e532f47bba17c5b9c5eb39b9354b8b7c64/models.py#L19
+     return x * (1 + scale) + shift
+diff --git a/models/SpaTrackV2/models/vggt4track/heads/dpt_head.py b/models/SpaTrackV2/models/vggt4track/heads/dpt_head.py
+index fa5cf6e..b93cf93 100644
+--- a/models/SpaTrackV2/models/vggt4track/heads/dpt_head.py
++++ b/models/SpaTrackV2/models/vggt4track/heads/dpt_head.py
+@@ -14,12 +14,26 @@ from typing import List, Dict, Tuple, Union
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
++# ── 跨文件依赖 ────────────────────────────────────────────────────
++#   activate_head            —— ./head_act.py
++#       把网络最后 1x1 conv 输出 (B, C, H, W) 拆成 (xyz/depth, conf) 并各自做激活：
++#       本类用 activation="exp" → depth = exp(raw)；conf_activation="sigmoid"。
++#   create_uv_grid           —— ./utils.py  生成归一化 UV 网格 (W,H,2)，用于位置编码。
++#   position_grid_to_embed   —— ./utils.py  把 2D 网格转 sin/cos 位置编码 (H,W,C)。
++# ─────────────────────────────────────────────────────────────────
+ from .head_act import activate_head
+ from .utils import create_uv_grid, position_grid_to_embed
+ 
+ 
+ class DPTHead(nn.Module):
+     """
++    论文 §3.1 中的 **Temporal DPT**。把 Aggregator 输出的多层 token（list[ (B,S,P,2C) ]）
++    转回稠密 depth + confidence。
++    与原版 DPT (Vision Transformers for Dense Prediction) 的关键不同：
++      * 输入是“时间扩展后的 token 序列”，每帧独立解码（chunk frames）；
++      * 取出 4 个中间层（默认 [4, 11, 17, 23]），分别做 projection + 上/下采样，得到 4 个不同分辨率的特征图；
++      * 用 RefineNet 风格的 FeatureFusionBlock 自顶向下融合；
++      * 末端 output_conv2 输出 2 通道：[depth_raw, conf_raw]，activate_head 分别激活。
+     DPT  Head for dense prediction tasks.
+ 
+     This implementation follows the architecture described in "Vision Transformers for Dense Prediction"
+@@ -63,9 +77,11 @@ class DPTHead(nn.Module):
+         self.down_ratio = down_ratio
+         self.intermediate_layer_idx = intermediate_layer_idx
+ 
++        # 输入 token 维度是 2*embed_dim（aggregator 的 frame+global 拼接）
+         self.norm = nn.LayerNorm(dim_in)
+ 
+-        # Projection layers for each output channel from tokens.
++        # 4 个 1x1 Conv 把每层 token 投影到 [256, 512, 1024, 1024] 通道。
++        # 浅层小通道、深层大通道 —— 标准 DPT 设计（浅层负责局部细节，深层负责语义/全局）。
+         self.projects = nn.ModuleList(
+             [
+                 nn.Conv2d(
+@@ -79,29 +95,33 @@ class DPTHead(nn.Module):
+             ]
+         )
+ 
+-        # Resize layers for upsampling feature maps.
++        # 4 个 resize：让 4 层特征图分辨率呈 [4×, 2×, 1×, 0.5×] 的金字塔，
++        # 之后 FeatureFusionBlock 自顶向下融合时正好 1:1 上采样。
+         self.resize_layers = nn.ModuleList(
+             [
+-                nn.ConvTranspose2d(
++                nn.ConvTranspose2d(  # 第 0 层 ×4 上采（patch_size=14 时还原细节）
+                     in_channels=out_channels[0], out_channels=out_channels[0], kernel_size=4, stride=4, padding=0
+                 ),
+-                nn.ConvTranspose2d(
++                nn.ConvTranspose2d(  # 第 1 层 ×2 上采
+                     in_channels=out_channels[1], out_channels=out_channels[1], kernel_size=2, stride=2, padding=0
+                 ),
+-                nn.Identity(),
+-                nn.Conv2d(
++                nn.Identity(),       # 第 2 层不变（最粗的基准分辨率）
++                nn.Conv2d(           # 第 3 层 ×0.5 下采（更小，作为顶层语义）
+                     in_channels=out_channels[3], out_channels=out_channels[3], kernel_size=3, stride=2, padding=1
+                 ),
+             ]
+         )
+ 
++        # scratch：用 3x3 Conv 把 4 个不同通道数的特征统一到 features=256；
++        # 然后挂上 4 个 RefineNet 风格的 fusion block（refinenet4 是顶层，has_residual=False）。
+         self.scratch = _make_scratch(
+             out_channels,
+             features,
+             expand=False,
+         )
+ 
+-        # Attach additional modules to scratch.
++        # FeatureFusionBlock 接受 (上层输出, 当层 _rn 特征) 两个张量做残差+上采样融合。
++        # refinenet4 是最深/最顶端 → 只接最高层；refinenet1/2/3 同时接下层输出 + 当层 _rn。
+         self.scratch.stem_transpose = None
+         self.scratch.refinenet1 = _make_fusion_block(features)
+         self.scratch.refinenet2 = _make_fusion_block(features)
+@@ -149,6 +169,7 @@ class DPTHead(nn.Module):
+         """
+         B, S, _, H, W = images.shape
+ 
++        # 显存控制：长视频 S 大时按 8 帧切块跑（仅推理；训练通常 S=24 直接一把过）。
+         # If frames_chunk_size is not specified or greater than S, process all frames at once
+         if frames_chunk_size is None or frames_chunk_size >= S:
+             return self._forward_impl(aggregated_tokens_list, images, patch_start_idx)
+@@ -215,30 +236,38 @@ class DPTHead(nn.Module):
+         out = []
+         dpt_idx = 0
+ 
++        # ── 依次处理 4 个中间层（默认 layer_idx ∈ [4, 11, 17, 23]） ──
+         for layer_idx in self.intermediate_layer_idx:
++            # ① 取该层 token 的 patch 部分（跳过 camera + register）
++            #    形状从 (B, S, P, 2*embed_dim) → (B, S, patch_h*patch_w, 2*embed_dim)
+             x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
+ 
+-            # Select frames if processing a chunk
++            # ② 帧 chunk 切片
+             if frames_start_idx is not None and frames_end_idx is not None:
+                 x = x[:, frames_start_idx:frames_end_idx]
+ 
++            # ③ flatten 帧维：(B*S, patch_h*patch_w, C)
+             x = x.view(B * S, -1, x.shape[-1])
+ 
+             x = self.norm(x)
+ 
++            # ④ 转回 2D 特征图布局：(B*S, C, patch_h, patch_w)
+             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+ 
++            # ⑤ 1x1 Conv 把 2*embed_dim → out_channels[dpt_idx]
+             x = self.projects[dpt_idx](x)
+             if self.pos_embed:
++                # 加上 sin/cos UV 位置编码（_apply_pos_embed 见下）
+                 x = self._apply_pos_embed(x, W, H)
++            # ⑥ resize：分别 ×4, ×2, ×1, ×0.5 形成多尺度金字塔
+             x = self.resize_layers[dpt_idx](x)
+ 
+             out.append(x)
+             dpt_idx += 1
+ 
+-        # Fuse features from multiple layers.
++        # ⑦ RefineNet 风格自顶向下融合：refinenet4 → 3 → 2 → 1 → output_conv1
+         out = self.scratch_forward(out)
+-        # Interpolate fused output to match target image resolution.
++        # ⑧ 双线性插值到目标分辨率（默认 down_ratio=1，即 patch_h*patch_size = H_proc）
+         out = custom_interpolate(
+             out,
+             (int(patch_h * self.patch_size / self.down_ratio), int(patch_w * self.patch_size / self.down_ratio)),
+@@ -252,7 +281,10 @@ class DPTHead(nn.Module):
+         if self.feature_only:
+             return out.view(B, S, *out.shape[1:])
+ 
++        # ⑨ output_conv2：1x1 + ReLU + 1x1 → 2 通道（[depth, conf]）
+         out = self.scratch.output_conv2(out)
++        # ⑩ activate_head (./head_act.py)：本类用 activation="exp"、conf_activation="sigmoid"
++        #     → depth = exp(out[:, 0]) 保证正值；conf ∈ (0,1)。
+         preds, conf = activate_head(out, activation=self.activation, conf_activation=self.conf_activation)
+ 
+         preds = preds.view(B, S, *preds.shape[1:])
+@@ -261,7 +293,10 @@ class DPTHead(nn.Module):
+ 
+     def _apply_pos_embed(self, x: torch.Tensor, W: int, H: int, ratio: float = 0.1) -> torch.Tensor:
+         """
+-        Apply positional embedding to tensor x.
++        给 2D 特征图加可加性的 sin/cos 位置编码。
++        - create_uv_grid (./utils.py): 生成 (patch_w, patch_h, 2) 的归一化 UV 网格（考虑长宽比 W/H）。
++        - position_grid_to_embed (./utils.py): 把 (H,W,2) 坐标转 (H,W,C) 的 sin/cos 编码。
++        ratio=0.1 是经验缩放：避免位置信息盖过 token 内容信号。
+         """
+         patch_w = x.shape[-1]
+         patch_h = x.shape[-2]
+@@ -273,21 +308,20 @@ class DPTHead(nn.Module):
+ 
+     def scratch_forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+         """
+-        Forward pass through the fusion blocks.
+-
+-        Args:
+-            features (List[Tensor]): List of feature maps from different layers.
+-
+-        Returns:
+-            Tensor: Fused feature map.
++        RefineNet-style 自顶向下融合：
++          layer4(顶层、最语义) →[refinenet4]→ + layer3 →[refinenet3]→ + layer2 →[refinenet2]→ + layer1 →[refinenet1]→ out
++        每步 FeatureFusionBlock 内部：
++          res = ResidualConvUnit(skip)；output += res；再 ResidualConvUnit + ×2 上采 + 1x1 conv → 下一级输入
+         """
+         layer_1, layer_2, layer_3, layer_4 = features
+ 
++        # 先用 layer{i}_rn (3x3 conv) 把通道统一到 features=256
+         layer_1_rn = self.scratch.layer1_rn(layer_1)
+         layer_2_rn = self.scratch.layer2_rn(layer_2)
+         layer_3_rn = self.scratch.layer3_rn(layer_3)
+         layer_4_rn = self.scratch.layer4_rn(layer_4)
+ 
++        # 顶层只有 layer4，无 skip（has_residual=False）
+         out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+         del layer_4_rn, layer_4
+ 
+@@ -300,6 +334,7 @@ class DPTHead(nn.Module):
+         out = self.scratch.refinenet1(out, layer_1_rn)
+         del layer_1_rn, layer_1
+ 
++        # output_conv1: 3x3 conv，把通道砍半为 features/2（用于 output_conv2 接入）
+         out = self.scratch.output_conv1(out)
+         return out
+ 
+@@ -355,7 +390,7 @@ def _make_scratch(in_shape: List[int], out_shape: int, groups: int = 1, expand:
+ 
+ 
+ class ResidualConvUnit(nn.Module):
+-    """Residual convolution module."""
++    """RefineNet 中的标准残差卷积单元：act → conv3x3 → act → conv3x3 → + x。"""
+ 
+     def __init__(self, features, activation, bn, groups=1):
+         """Init.
+@@ -400,7 +435,15 @@ class ResidualConvUnit(nn.Module):
+ 
+ 
+ class FeatureFusionBlock(nn.Module):
+-    """Feature fusion block."""
++    """
++    DPT/RefineNet 的核心融合块。
++    forward(xs):
++      xs[0] = 来自上一级（更深层）的 output；
++      xs[1] = 当前层 skip 特征（layer{i}_rn 的输出）。
++      流程：res = ResidualConvUnit1(xs[1]); output = xs[0] + res
++            → ResidualConvUnit2(output) → ×2 上采（或指定 size） → 1x1 conv out_conv
++    顶层（has_residual=False）只接 xs[0]，跳过第一步。
++    """
+ 
+     def __init__(
+         self,
+diff --git a/models/SpaTrackV2/models/vggt4track/heads/head_act.py b/models/SpaTrackV2/models/vggt4track/heads/head_act.py
+index 2dedfcf..55a2c53 100644
+--- a/models/SpaTrackV2/models/vggt4track/heads/head_act.py
++++ b/models/SpaTrackV2/models/vggt4track/heads/head_act.py
+@@ -9,8 +9,18 @@ import torch
+ import torch.nn.functional as F
+ 
+ 
++# ============================================================
++# 本文件是“激活函数 dispatcher”，供 ./camera_head.py、./scale_head.py、./dpt_head.py 使用：
++#   activate_pose     → CameraHead/ScaleHead 在每次迭代末尾调用，分别处理 T/quat/FoV。
++#   activate_head     → DPTHead 末端调用，把 (B, C, H, W) 拆成 (xyz/depth, conf) 并激活。
++#   base_pose_act     → 单维度激活分发（linear / inv_log / exp / relu）。
++#   inverse_log_transform → 逆 log 变换，便于网络输出有界且可覆盖大动态范围的量（深度常用）。
++# ============================================================
++
++
+ def activate_pose(pred_pose_enc, trans_act="linear", quat_act="linear", fl_act="linear"):
+     """
++    把 9D pose 编码 [T(3), quat(4), FoV(2)] 拆开，分别做激活后拼回。
+     Activate pose parameters with specified activation functions.
+ 
+     Args:
+@@ -60,6 +70,10 @@ def base_pose_act(pose_enc, act_type="linear"):
+ 
+ def activate_head(out, activation="norm_exp", conf_activation="expp1"):
+     """
++    DPTHead 末端用。把 (B, C, H, W) → (B, H, W, C)，前 C-1 通道当 xyz/depth 激活，最后 1 通道当 conf 激活。
++    在 VGGT4Track 里参数是 activation="exp", conf_activation="sigmoid"，即：
++        depth = exp(raw)   （正值保证）
++        conf  = sigmoid(raw) ∈ (0, 1)
+     Process network output to extract 3D points and confidence values.
+ 
+     Args:
+diff --git a/models/SpaTrackV2/models/vggt4track/heads/scale_head.py b/models/SpaTrackV2/models/vggt4track/heads/scale_head.py
+index 7e2a551..9ceae8e 100644
+--- a/models/SpaTrackV2/models/vggt4track/heads/scale_head.py
++++ b/models/SpaTrackV2/models/vggt4track/heads/scale_head.py
+@@ -11,6 +11,7 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
++# 跨文件依赖：同 camera_head（Mlp/Block/activate_pose），结构镜像 CameraHead 实现。
+ from models.SpaTrackV2.models.vggt4track.layers import Mlp
+ from models.SpaTrackV2.models.vggt4track.layers.block import Block
+ from models.SpaTrackV2.models.vggt4track.heads.head_act import activate_pose
+@@ -18,9 +19,14 @@ from models.SpaTrackV2.models.vggt4track.heads.head_act import activate_pose
+ 
+ class ScaleHead(nn.Module):
+     """
+-    ScaleHead predicts camera parameters from token representations using iterative refinement.
+-
+-    It applies a series of transformer blocks (the "trunk") to dedicated camera tokens.
++    论文 §3.1 末尾公式 (1): P^t, a, b = H(P_tok, S_tok) 中的 (a, b) 由本 head 输出。
++    a = 把 raw normalized depth 拉到 metric scale 的标量；b = 整体平移。
++    实现上几乎照搬 CameraHead 的迭代结构，只把 target_dim 改成 2，
++    并在最后把第 0 维 clip 到 [1e-5, 1e3]、第 1 维乘 1e-2（缩到合理量级）。
++
++    注：本 head 仅在 ../models/tracker_front.py 这条“替代前端”里被实例化；
++    主路径 vggt_moe.py:VGGT4Track 并不使用 ScaleHead，scale/shift 在
++    后端 (TrackRefiner3D 的 EfficientUpdateFormer3D) 内部估计。
+     """
+ 
+     def __init__(
+@@ -37,6 +43,7 @@ class ScaleHead(nn.Module):
+     ):
+         super().__init__()
+ 
++        # 输出 2D：[scale, shift] —— 与 CameraHead 的 target_dim=9 唯一区别。
+         self.target_dim = 2
+ 
+         self.trans_act = trans_act
+@@ -92,7 +99,8 @@ class ScaleHead(nn.Module):
+         # Use tokens from the last block for camera prediction.
+         tokens = aggregated_tokens_list[-1]
+ 
+-        # Extract the camera tokens
++        # 注意：这里取 index 5，对应 "register_token[4]"（camera(1) + register(4)，前 5 个 special token），
++        # 也就是用 register token 的最后一个作为 scale token。与论文图 2 的 “Scale Tokens” 对应。
+         pose_tokens = tokens[:, :, 5]
+         pose_tokens = self.token_norm(pose_tokens)
+ 
+@@ -146,6 +154,8 @@ class ScaleHead(nn.Module):
+                 quat_act=self.quat_act,
+                 fl_act=self.fl_act,
+             )
++            # scale (index 0) 必须为正且不过大 → clamp 到 [1e-5, 1e3]
++            # shift (index 1) 乘 1e-2：让平移系数从 0 附近开始，避免训练初期数值爆炸
+             activated_pose_proc = activated_pose.clone()
+             activated_pose_proc[...,:1] = activated_pose_proc[...,:1].clamp(min=1e-5, max=1e3)
+             activated_pose_proc[...,1:] = activated_pose_proc[...,1:]*1e-2
+diff --git a/models/SpaTrackV2/models/vggt4track/heads/utils.py b/models/SpaTrackV2/models/vggt4track/heads/utils.py
+index 533fc8a..8f50d2b 100644
+--- a/models/SpaTrackV2/models/vggt4track/heads/utils.py
++++ b/models/SpaTrackV2/models/vggt4track/heads/utils.py
+@@ -8,6 +8,15 @@ import torch
+ import torch.nn as nn
+ 
+ 
++# ============================================================
++# DPT-style 位置编码工具。被 ../heads/dpt_head.py::_apply_pos_embed 调用：
++#   create_uv_grid       → 按 aspect ratio 构造归一化 UV 网格 (W,H,2)。
++#   position_grid_to_embed → 把 (H,W,2) 坐标转 sin/cos 编码 (H,W,C)。
++# 与 ../layers/rope.py 区别：这里是“加性”绝对位置编码（用在特征图上）；
++# rope.py 是“乘性旋转”相对位置编码（用在 attention 的 q,k 上）。
++# ============================================================
++
++
+ def position_grid_to_embed(pos_grid: torch.Tensor, embed_dim: int, omega_0: float = 100) -> torch.Tensor:
+     """
+     Convert 2D position grid (HxWx2) to sinusoidal embeddings (HxWxC)
+@@ -35,6 +44,8 @@ def position_grid_to_embed(pos_grid: torch.Tensor, embed_dim: int, omega_0: floa
+ 
+ def make_sincos_pos_embed(embed_dim: int, pos: torch.Tensor, omega_0: float = 100) -> torch.Tensor:
+     """
++    1D sin/cos 位置编码：embed = [sin(pos / ω₀^k), cos(pos / ω₀^k)]，k 跨 embed_dim/2 个频率。
++    与 Transformer 原版位置编码思路一致，区别只是 base ω₀=100（vs 10000）。
+     This function generates a 1D positional embedding from a given grid using sine and cosine functions.
+ 
+     Args:
+@@ -67,6 +78,9 @@ def create_uv_grid(
+     width: int, height: int, aspect_ratio: float = None, dtype: torch.dtype = None, device: torch.device = None
+ ) -> torch.Tensor:
+     """
++    生成考虑 aspect ratio 的归一化 UV 网格：左上角 (-x_span, -y_span)，右下角 (x_span, y_span)，
++    其中 x_span²+y_span² = 1（按对角线归一化）。这样不同长宽比的图共享一致的 UV 量级，
++    位置编码就有跨分辨率的可比性。代码来源参考 microsoft/moge。
+     Create a normalized UV grid of shape (width, height, 2).
+ 
+     The grid spans horizontally and vertically according to an aspect ratio,
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/__init__.py b/models/SpaTrackV2/models/vggt4track/layers/__init__.py
+index 8120f4b..764a821 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/__init__.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/__init__.py
+@@ -4,6 +4,9 @@
+ # This source code is licensed under the license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++# 子模块的统一导出。提供给上层一种简洁的 import 方式：
++#   from models.SpaTrackV2.models.vggt4track.layers import Mlp / PatchEmbed
++# 主路径用得最多的是：Mlp（被 camera_head/scale_head 用），PatchEmbed（被 aggregator "conv" 分支用）。
+ from .mlp import Mlp
+ from .patch_embed import PatchEmbed
+ from .swiglu_ffn import SwiGLUFFN, SwiGLUFFNFused
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/attention.py b/models/SpaTrackV2/models/vggt4track/layers/attention.py
+index ab3089c..66c49c1 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/attention.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/attention.py
+@@ -18,6 +18,14 @@ import torch.nn.functional as F
+ XFORMERS_AVAILABLE = False
+ 
+ 
++# ============================================================
++# 标准 multi-head self-attention，可选：
++#   * QK-norm：把 q, k 各自过一个 head-dim 维度的 LayerNorm —— 训练稳定（参考 ViT-22B）。
++#   * RoPE  : 来自 ./rope.py 的 RotaryPositionEmbedding2D，调用时对 q, k 应用旋转，
++#             以 (B, N, 2) 的 pos 参数为位置索引。aggregator 默认开启。
++#   * fused_attn: 使用 F.scaled_dot_product_attention（torch 2.x 的 SDPA 内核，
++#             自动 Flash / mem-efficient / math 三选一）。
++# ============================================================
+ class Attention(nn.Module):
+     def __init__(
+         self,
+@@ -49,10 +57,13 @@ class Attention(nn.Module):
+ 
+     def forward(self, x: Tensor, pos=None) -> Tensor:
+         B, N, C = x.shape
++        # 一次 Linear 输出 3*C 然后切成 q, k, v；最后 permute 成 (3, B, head, N, head_dim)。
+         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+         q, k, v = qkv.unbind(0)
+-        q, k = self.q_norm(q), self.k_norm(k)
++        q, k = self.q_norm(q), self.k_norm(k)  # 可选 QK-norm
+ 
++        # 把 RoPE 作用在 q, k 上 —— 相对位置编码；v 不旋转。
++        # self.rope 由 aggregator 在构造 Block 时传入（./rope.py: RotaryPositionEmbedding2D）。
+         if self.rope is not None:
+             q = self.rope(q, pos)
+             k = self.rope(k, pos)
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/block.py b/models/SpaTrackV2/models/vggt4track/layers/block.py
+index 5f89e4d..f24a391 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/block.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/block.py
+@@ -14,7 +14,15 @@ import warnings
+ 
+ import torch
+ from torch import nn, Tensor
+-
++from xformers.ops import fmha
++# ── 本目录内的小依赖 ────────────────────────────────
++#   Attention   —— ./attention.py：标准 multi-head self-attention + 可选 RoPE。
++#   DropPath    —— ./drop_path.py：Stochastic Depth。
++#   LayerScale  —— ./layer_scale.py：每通道一个可学习 gamma，初始化很小。
++#   Mlp         —— ./mlp.py：2 层 Linear+GELU。
++# 上层使用方：aggregator.py (frame_blocks/global_blocks)，camera_head/scale_head 的 trunk。
++# 训练时被 torch.utils.checkpoint.checkpoint 包住做 grad checkpointing。
++# ────────────────────────────────────────────────────
+ from .attention import Attention
+ from .drop_path import DropPath
+ from .layer_scale import LayerScale
+@@ -25,6 +33,12 @@ XFORMERS_AVAILABLE = False
+ 
+ 
+ class Block(nn.Module):
++    """
++    标准 pre-norm Transformer block：
++        x' = x + LayerScale(Attn(LN(x), pos)) ;  pos 可选——传 (B,N,2) 后 Attention 内部对 q,k 做 RoPE
++        x  = x' + LayerScale(MLP(LN(x')))
++    DropPath（Stochastic Depth）在 self.training 且 drop_ratio>0.1 时切换到更高效的“子集前向”实现。
++    """
+     def __init__(
+         self,
+         dim: int,
+@@ -79,6 +93,9 @@ class Block(nn.Module):
+         self.sample_drop_ratio = drop_path
+ 
+     def forward(self, x: Tensor, pos=None) -> Tensor:
++        # 两个 residual 子函数：先 LN 再过 attn/mlp，再 LayerScale。
++        # pos: aggregator 传入 (B*S, P, 2) 的 (y, x) 坐标，给 RoPE 用；
++        #      camera_head/scale_head 的 trunk 调用时 pos=None。
+         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
+             return self.ls1(self.attn(self.norm1(x), pos=pos))
+ 
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/drop_path.py b/models/SpaTrackV2/models/vggt4track/layers/drop_path.py
+index 1d640e0..46a235e 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/drop_path.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/drop_path.py
+@@ -11,6 +11,8 @@
+ from torch import nn
+ 
+ 
++# Stochastic Depth (DropPath)：仅训练时按 batch 样本独立丢弃整路残差，等价 “随机跳过这一层”。
++# Block.forward 里 drop_ratio>0 才生效；vggt4track 默认初始化是 0 → 即恒等。
+ def drop_path(x, drop_prob: float = 0.0, training: bool = False):
+     if drop_prob == 0.0 or not training:
+         return x
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/layer_scale.py b/models/SpaTrackV2/models/vggt4track/layers/layer_scale.py
+index 51df0d7..a9ef0e2 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/layer_scale.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/layer_scale.py
+@@ -12,6 +12,9 @@ from torch import Tensor
+ from torch import nn
+ 
+ 
++# LayerScale：每通道一个可学习 gamma（CaiT 提出）。
++# Block.forward 用法：x ← x + ls1(attn(...)) ；x ← x + ls2(mlp(...))
++# 初值 init_values=0.01（在 aggregator 中传入），让训练初期残差被压小、便于稳定。
+ class LayerScale(nn.Module):
+     def __init__(
+         self,
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/mlp.py b/models/SpaTrackV2/models/vggt4track/layers/mlp.py
+index bbf9432..7e7a379 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/mlp.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/mlp.py
+@@ -13,6 +13,8 @@ from typing import Callable, Optional
+ from torch import Tensor, nn
+ 
+ 
++# 标准两层 MLP：Linear → act(GELU) → Linear，外加可选 dropout。
++# 在本工程中既被 Block 用作 FFN，也被 camera_head/scale_head 的 pose_branch / pose modulation 用。
+ class Mlp(nn.Module):
+     def __init__(
+         self,
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/patch_embed.py b/models/SpaTrackV2/models/vggt4track/layers/patch_embed.py
+index 8b7c080..06e3284 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/patch_embed.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/patch_embed.py
+@@ -13,6 +13,12 @@ from torch import Tensor
+ import torch.nn as nn
+ 
+ 
++# ============================================================
++# 最朴素版 patch embed：仅一个 Conv2d(kernel=patch, stride=patch) 把 (B,C,H,W) → (B,N,D)。
++# 仅当 aggregator 的 patch_embed 参数包含 "conv" 时被走到（默认走 DINOv2 ViT 路径）。
++# ============================================================
++
++
+ def make_2tuple(x):
+     if isinstance(x, tuple):
+         assert len(x) == 2
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/rope.py b/models/SpaTrackV2/models/vggt4track/layers/rope.py
+index 4d5d333..e531738 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/rope.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/rope.py
+@@ -21,6 +21,16 @@ import torch.nn.functional as F
+ from typing import Dict, Tuple
+ 
+ 
++# ============================================================
++# 2D RoPE 实现（被 ./attention.py 通过 Block 传入的 self.rope 调用）。
++# 上层入口在 ../models/aggregator.py：
++#   self.rope = RotaryPositionEmbedding2D(frequency=rope_freq)
++#   self.position_getter = PositionGetter()
++#   pos = self.position_getter(B*S, H/14, W/14, device)  → (B*S, P, 2)
++# 然后 Block.forward(x, pos) → Attention.forward(x, pos) → self.rope(q, pos), self.rope(k, pos)
++# ============================================================
++
++
+ class PositionGetter:
+     """Generates and caches 2D spatial positions for patches in a grid.
+ 
+@@ -60,7 +70,11 @@ class PositionGetter:
+ 
+ 
+ class RotaryPositionEmbedding2D(nn.Module):
+-    """2D Rotary Position Embedding implementation.
++    """
++    2D RoPE：把特征维度对半切，一半按 y 坐标做 1D RoPE，一半按 x 坐标做 1D RoPE，再拼回。
++    每个 1D RoPE 形式：x' = x*cos(θ) + rotate(x)*sin(θ)，其中 rotate 把后半部分前置并取负。
++    频率公式：ω_k = 1 / base^(2k/d)，base = self.base_frequency（默认 100）。
++    2D Rotary Position Embedding implementation.
+ 
+     This module applies rotary position embeddings to input tokens based on their
+     2D spatial positions. It handles the position-dependent rotation of features
+@@ -170,19 +184,19 @@ class RotaryPositionEmbedding2D(nn.Module):
+         assert tokens.size(-1) % 2 == 0, "Feature dimension must be even"
+         assert positions.ndim == 3 and positions.shape[-1] == 2, "Positions must have shape (batch_size, n_tokens, 2)"
+ 
+-        # Compute feature dimension for each spatial direction
++        # 特征维度对半分：上半段（feature_dim） → 编码 y；下半段 → 编码 x。
+         feature_dim = tokens.size(-1) // 2
+ 
+-        # Get frequency components
++        # 根据当前 batch 见到的最大位置生成 cos/sin 表（带缓存）。
+         max_position = int(positions.max()) + 1
+         cos_comp, sin_comp = self._compute_frequency_components(feature_dim, max_position, tokens.device, tokens.dtype)
+ 
+-        # Split features for vertical and horizontal processing
++        # 拆分 q/k 的最后一维：前一半承载 y 旋转，后一半承载 x 旋转。
+         vertical_features, horizontal_features = tokens.chunk(2, dim=-1)
+ 
+-        # Apply RoPE separately for each dimension
++        # 分别用 y / x 坐标查表后 rotate。
+         vertical_features = self._apply_1d_rope(vertical_features, positions[..., 0], cos_comp, sin_comp)
+         horizontal_features = self._apply_1d_rope(horizontal_features, positions[..., 1], cos_comp, sin_comp)
+ 
+-        # Combine processed features
++        # 拼回去：2D RoPE 结果。
+         return torch.cat((vertical_features, horizontal_features), dim=-1)
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/swiglu_ffn.py b/models/SpaTrackV2/models/vggt4track/layers/swiglu_ffn.py
+index 54fe8e9..fafa23b 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/swiglu_ffn.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/swiglu_ffn.py
+@@ -11,6 +11,9 @@ from torch import Tensor, nn
+ import torch.nn.functional as F
+ 
+ 
++# SwiGLU FFN（PaLM/LLaMA 风格）：把 Linear 输出对半切，一半过 SiLU 与另一半 gating 相乘。
++# 在 DinoVisionTransformer 的 ffn_layer="swiglu" 选项里会被启用；vggt4track 默认 ffn_layer="mlp"，
++# 因此本模块在主路径其实不参与训练/推理，仅作为可选项保留。
+ class SwiGLUFFN(nn.Module):
+     def __init__(
+         self,
+diff --git a/models/SpaTrackV2/models/vggt4track/layers/vision_transformer.py b/models/SpaTrackV2/models/vggt4track/layers/vision_transformer.py
+index 120cbe6..a3c8291 100644
+--- a/models/SpaTrackV2/models/vggt4track/layers/vision_transformer.py
++++ b/models/SpaTrackV2/models/vggt4track/layers/vision_transformer.py
+@@ -16,11 +16,26 @@ import torch
+ import torch.nn as nn
+ from torch.utils.checkpoint import checkpoint
+ from torch.nn.init import trunc_normal_
++# 这里的 Block 用的是 ./block.py 中的 NestedTensorBlock（与 aggregator 用的 Block 是同源）。
++# 注意 aggregator.py 用法不同：那里直接 from .block import Block；这里给 DINOv2 风格初始化用。
+ from . import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
+ 
+ logger = logging.getLogger("dinov2")
+ 
+ 
++# ============================================================
++# 本文件提供 DINOv2 风格的 ViT 骨架 (DinoVisionTransformer) 及四个尺寸的工厂函数：
++#   vit_small / vit_base / vit_large / vit_giant2 —— 被 ../models/aggregator.py 调用作为 patch_embed。
++#   只有最深的 patch token 序列被 aggregator 进一步使用；cls/register/pos_embed 仅作为预训练加载的“衣架”。
++# 主要功能：
++#   * patch_embed：原 ConvPatchEmbed（./patch_embed.py）。
++#   * cls_token + register_tokens + 绝对位置 embedding（DINOv2 v2 加 register）。
++#   * forward_features 返回 dict，aggregator 只取 x_norm_patchtokens。
++#   * 加载 ImageNet 预训练 dinov2_vitl14_reg.pth 时，能与原仓库权重严格对齐。
++# 在 mask_token 上 detach 梯度（aggregator 里也再次 requires_grad_(False)），因为 SpaTrackV2 不做 mask 预训练。
++# ============================================================
++
++
+ def named_apply(fn: Callable, module: nn.Module, name="", depth_first=True, include_root=False) -> nn.Module:
+     if not depth_first and include_root:
+         fn(module=module, name=name)
+@@ -377,6 +392,8 @@ def vit_base(patch_size=16, num_register_tokens=0, **kwargs):
+ 
+ 
+ def vit_large(patch_size=16, num_register_tokens=0, **kwargs):
++    # SpaTrackV2 默认走这条：embed_dim=1024, depth=24, num_heads=16；
++    # 与 dinov2_vitl14_reg 的官方权重对齐。aggregator 拿到的 patch token 维度即此 1024。
+     model = DinoVisionTransformer(
+         patch_size=patch_size,
+         embed_dim=1024,
+diff --git a/models/SpaTrackV2/models/vggt4track/models/aggregator.py b/models/SpaTrackV2/models/vggt4track/models/aggregator.py
+index 07fd59e..f2ffeb7 100644
+--- a/models/SpaTrackV2/models/vggt4track/models/aggregator.py
++++ b/models/SpaTrackV2/models/vggt4track/models/aggregator.py
+@@ -10,6 +10,16 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from typing import Optional, Tuple, Union, List, Dict, Any
+ 
++# ── 跨文件依赖 ───────────────────────────────────────────────────────────
++#   PatchEmbed                 —— ../layers/patch_embed.py（简单 Conv2d patchify）
++#   Block                      —— ../layers/block.py（标准 Transformer block，pre-norm + RoPE）
++#   RotaryPositionEmbedding2D  —— ../layers/rope.py（2D RoPE，作用在 (q,k) 上）
++#   PositionGetter             —— ../layers/rope.py（缓存每个网格大小的 (y,x) 位置）
++#   vit_small/base/large/giant2 —— ../layers/vision_transformer.py
++#       论文中提到的“DINOv2-ViT-L/14 + register tokens”就是这里的 vit_large("dinov2_vitl14_reg")。
++#       用作 patch embedding（充当 image 编码器输出），在 alternating-attention 之前先把
++#       (B*S, 3, H, W) → (B*S, P, embed_dim) 的 patch token 序列。
++# ────────────────────────────────────────────────────────────────────────
+ from models.SpaTrackV2.models.vggt4track.layers import PatchEmbed
+ from models.SpaTrackV2.models.vggt4track.layers.block import Block
+ from models.SpaTrackV2.models.vggt4track.layers.rope import RotaryPositionEmbedding2D, PositionGetter
+@@ -18,12 +28,19 @@ from torch.utils.checkpoint import checkpoint
+ 
+ logger = logging.getLogger(__name__)
+ 
++# 用 ImageNet/ResNet 归一化常数（论文 §3.1 沿用 DINOv2 输入分布）。
+ _RESNET_MEAN = [0.485, 0.456, 0.406]
+ _RESNET_STD = [0.229, 0.224, 0.225]
+ 
+ 
+ class Aggregator(nn.Module):
+     """
++    论文 §3.1 中的 **Temporal Encoder**（VGGT 的 "Aggregator"）。
++    输入: (B, S, 3, H, W)  →  输出: List[(B, S, P, embed_dim)]，每层一份。
++    机制: alternating attention —— 按 aa_order=["frame","global"] 顺序，
++          一层只在帧内做 self-attention，下一层把所有帧的 token 串成 (S*P)
++          一起做 global self-attention。论文图 2 中 Pose/Scale tokens 就藏在
++          这些 token 序列里（这里叫 camera_token；register_token 是 DINOv2 风格的辅助 token）。
+     The Aggregator applies alternating-attention over input frames,
+     as described in VGGT: Visual Geometry Grounded Transformer.
+ 
+@@ -70,12 +87,18 @@ class Aggregator(nn.Module):
+     ):
+         super().__init__()
+ 
++        # 构建 patch_embed：根据 patch_embed 字符串（默认 "dinov2_vitl14_reg"）
++        # 选择 vit_large 等 DINOv2 backbone（见 __build_patch_embed__）。
+         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
+ 
+-        # Initialize rotary position embedding if frequency > 0
++        # 2D RoPE：作用于每个 attention block 内的 q, k，不写到 token 上；
++        # 通过 PositionGetter 取到 (H/14, W/14) 的 (y,x) 坐标后传进 Block。
+         self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
+         self.position_getter = PositionGetter() if self.rope is not None else None
+ 
++        # frame_blocks：每个 block 只在单帧内（B*S, P, C）做 attention（帧内空间建模）。
++        # global_blocks：每个 block 在 (B, S*P, C) 上做 attention（跨帧/时序建模）。
++        # 两者堆叠 depth=24 层（与 ViT-L/14 一致），用 aa_order=["frame","global"] 交替推进。
+         self.frame_blocks = nn.ModuleList(
+             [
+                 block_fn(
+@@ -121,12 +144,17 @@ class Aggregator(nn.Module):
+ 
+         self.aa_block_num = self.depth // self.aa_block_size
+ 
+-        # Note: We have two camera tokens, one for the first frame and one for the rest
+-        # The same applies for register tokens
++        # camera_token / register_token 的第 1 维大小是 2：
++        #   index 0 → "first-frame" 专用 token（视频里第一帧用它，相当于 world-anchor 帧）
++        #   index 1 → 其余所有帧 (S-1) 共享同一组 token
++        # 这样设计的目的是让“第一帧的位姿/scale 可以被显式定为参考系”。
++        # camera_token 对应论文图 2 中 Pose Tokens / Scale Tokens 的载体 ——
++        # 后续 CameraHead 取 token[:,:,0] 解码位姿；ScaleHead 取 token[:,:,5] 解码 scale/shift。
+         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
+         self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
+ 
+-        # The patch tokens start after the camera and register tokens
++        # 拼接顺序：[camera_token(1) | register_token(num_register) | patch_tokens(P)]
++        # patch_start_idx 标记 patch token 在序列中的起点，下游 DPTHead 用它跳过 special token。
+         self.patch_start_idx = 1 + num_register_tokens
+ 
+         # Initialize parameters with small values
+@@ -161,11 +189,15 @@ class Aggregator(nn.Module):
+         simple PatchEmbed conv layer. Otherwise, we use a vision transformer.
+         """
+ 
++        # patch_embed 字符串若包含 "conv" → 用最朴素的 Conv patchify（PatchEmbed in ../layers/patch_embed.py）。
++        # 否则用 DINOv2 风格 ViT（带 register tokens）作 patch embed —— 这是默认路径，
++        # 对应论文中“build on DepthAnythingV2 / DINOv2”的描述。
+         if "conv" in patch_embed:
+             self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=3, embed_dim=embed_dim)
+         else:
++            # vit_* 函数定义在 ../layers/vision_transformer.py，对应论文 Table 列出的不同 DINOv2 变体。
+             vit_models = {
+-                "dinov2_vitl14_reg": vit_large,
++                "dinov2_vitl14_reg": vit_large,    # 1024-dim, depth=24（默认）
+                 "dinov2_vitb14_reg": vit_base,
+                 "dinov2_vits14_reg": vit_small,
+                 "dinov2_vitg2_reg": vit_giant2,
+@@ -204,56 +236,69 @@ class Aggregator(nn.Module):
+         if C_in != 3:
+             raise ValueError(f"Expected 3 input channels, got {C_in}")
+ 
+-        # Normalize images and reshape for patch embed
++        # ① RGB 归一化（用 ImageNet 均值/方差，DINOv2 训练分布）。
+         images = (images - self._resnet_mean) / self._resnet_std
+ 
+-        # Reshape to [B*S, C, H, W] for patch embedding
++        # ② 把帧序列 flatten 到 batch 维：(B,S,3,H,W) → (B*S,3,H,W)
+         images = images.view(B * S, C_in, H, W)
++        # ③ Patch Embedding：(B*S,3,H,W) → (B*S, P_patch, embed_dim)
++        # 走的是 DINOv2 ViT 的 forward_features，返回 dict（x_norm_patchtokens 是去 cls/reg 后的纯 patch token）。
+         patch_tokens = self.patch_embed(images)
+ 
+         if isinstance(patch_tokens, dict):
++            # 仅保留 patch tokens；下面我们会自己拼上 camera/register token（区别于 DINOv2 自带的 cls/reg）。
+             patch_tokens = patch_tokens["x_norm_patchtokens"]
+ 
+         _, P, C = patch_tokens.shape
+ 
+-        # Expand camera and register tokens to match batch size and sequence length
++        # ④ 把 camera/register token 按 “第一帧 vs 其余帧” 的两组参数广播到所有帧，
++        # 然后 (B,S,X,C) flatten 成 (B*S, X, C)。详见函数 slice_expand_and_flatten。
+         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
+         register_token = slice_expand_and_flatten(self.register_token, B, S)
+ 
+-        # Concatenate special tokens with patch tokens
++        # ⑤ 拼接：每帧序列变成 [1 camera | num_register | P patches]。
+         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+ 
++        # ⑥ 计算每个 patch 的 (y,x) 网格坐标，传给 RoPE 作为旋转角度的 index。
+         pos = None
+         if self.rope is not None:
++            # PositionGetter (../layers/rope.py) 缓存 (h,w) 网格的 cartesian_prod。
+             pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+ 
+         if self.patch_start_idx > 0:
+-            # do not use position embedding for special tokens (camera and register tokens)
+-            # so set pos to 0 for the special tokens
++            # camera/register token 没有空间位置，给它们的 pos 设为 0；
++            # patch token 的 pos 整体 +1 偏移避开 0，确保 RoPE 不把它们当成同一个位置。
+             pos = pos + 1
+             pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
+             pos = torch.cat([pos_special, pos], dim=1)
+ 
+-        # update P because we added special tokens
++        # 此时 P = 1 + num_register + (H/14)*(W/14)，C = embed_dim。
+         _, P, C = tokens.shape
+ 
+         frame_idx = 0
+         global_idx = 0
+         output_list = []
+ 
++        # ⑦ 交替注意力主循环：aa_block_num = depth=24（默认每步处理 1 个 frame block + 1 个 global block）。
++        # 每跑完一轮 [frame, global]，把两路的中间输出沿通道拼接 → (B,S,P,2C)，存入 output_list。
++        # 下游 CameraHead/DPTHead 直接用 2*embed_dim 作为输入通道。
+         for _ in range(self.aa_block_num):
+             for attn_type in self.aa_order:
+                 if attn_type == "frame":
++                    # 帧内 attention：reshape 成 (B*S, P, C)。Block.forward 见 ../layers/block.py。
+                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
+                         tokens, B, S, P, C, frame_idx, pos=pos
+                     )
+                 elif attn_type == "global":
++                    # 全局 attention：reshape 成 (B, S*P, C)，跨帧建模（论文里说的 "global self-attention"）。
+                     tokens, global_idx, global_intermediates = self._process_global_attention(
+                         tokens, B, S, P, C, global_idx, pos=pos
+                     )
+                 else:
+                     raise ValueError(f"Unknown attention type: {attn_type}")
+ 
++            # 论文 §3.1：frame 与 global 分支的中间特征沿通道拼接 → 给 head 用，
++            # 因此 CameraHead/DPTHead 的 dim_in = 2 * embed_dim。
+             for i in range(len(frame_intermediates)):
+                 # concat frame and global intermediates, [B x S x P x 2C]
+                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+@@ -262,10 +307,12 @@ class Aggregator(nn.Module):
+         del concat_inter
+         del frame_intermediates
+         del global_intermediates
++        # 返回：所有层的拼接特征列表 + patch token 在 P 维上的起始 index
+         return output_list, self.patch_start_idx
+ 
+     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+         """
++        帧内 attention：把 token 整成 (B*S, P, C)，每帧独立做 self-attention（空间建模）。
+         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
+         """
+         # If needed, reshape tokens or positions:
+@@ -290,6 +337,8 @@ class Aggregator(nn.Module):
+ 
+     def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+         """
++        全局 attention：把所有帧的 token 串成 (B, S*P, C) 一起 attention（时序+空间联合建模）。
++        论文 §3.1 中 “inter-frame attention over flattened video tokens”。
+         Process global attention blocks. We keep tokens in shape (B, S*P, C).
+         """
+         if tokens.shape != (B, S * P, C):
+@@ -314,6 +363,10 @@ class Aggregator(nn.Module):
+ 
+ def slice_expand_and_flatten(token_tensor, B, S):
+     """
++    将 (1, 2, X, C) 的 special token 参数广播为 (B*S, X, C)：
++      索引 0 → 仅给第一帧（world-anchor 帧）；
++      索引 1 → 给其余 S-1 帧（共享同一组参数）。
++    用于 camera_token / register_token（X 分别是 1 和 num_register）。
+     Processes specialized tokens with shape (1, 2, X, C) for multi-frame processing:
+     1) Uses the first position (index=0) for the first frame only
+     2) Uses the second position (index=1) for all remaining frames (S-1 frames)
+diff --git a/models/SpaTrackV2/models/vggt4track/models/vggt_moe.py b/models/SpaTrackV2/models/vggt4track/models/vggt_moe.py
+index 9706c5c..3139fe9 100644
+--- a/models/SpaTrackV2/models/vggt4track/models/vggt_moe.py
++++ b/models/SpaTrackV2/models/vggt4track/models/vggt_moe.py
+@@ -6,12 +6,31 @@
+ 
+ import torch
+ import torch.nn as nn
+-from huggingface_hub import PyTorchModelHubMixin  # used for model hub
+-
++from huggingface_hub import PyTorchModelHubMixin  # 用于 Huggingface Hub 上传/下载权重的 mixin
++
++# ------------------------------------------------------------
++# 跨文件依赖说明（前端 vggt4track 的核心组件）：
++#   Aggregator                —— 来自 ./aggregator.py
++#       即论文中的 "Temporal Encoder"，DINOv2 patch embed + 交替帧内/全局注意力。
++#   CameraHead                —— 来自 ../heads/camera_head.py
++#       论文中的 "Neural Camera Tracker"，迭代细化输出 9D 位姿编码 (T, quat, FoV)。
++#   DPTHead                   —— 来自 ../heads/dpt_head.py
++#       论文中的 "Temporal DPT"，从多层 token 多尺度融合出 dense depth + 置信度。
++#   TrackHead                 —— 来自 ../heads/track_head.py
++#       2D 点 tracking head（VGGT 原版有，本 VGGT4Track 类**未实例化**，仅保留 import）。
++#   compute_loss              —— 来自 ../utils/loss.py
++#       仅在 self.training=True 时被调用，组合 depth/edge/normal/cons/scale_shift/pose 等 loss。
++#   pose_encoding_to_extri_intri —— 来自 ../utils/pose_enc.py
++#       把 (B,S,9) 位姿编码反解为 (extrinsics 3x4, intrinsics 3x3)。
++#   depth_to_points_colmap    —— 来自 ../../tracker3D/spatrack_modules/utils.py
++#       用 intrinsics 把 dense depth 反投影为 camera 系下的 point map (H,W,3)。
++#   preprocess_image          —— 来自 ../utils/load_fn.py
++#       图像预处理：resize 到 14 的倍数（patch_size 兼容），crop/pad 到 518。
++# ------------------------------------------------------------
+ from models.SpaTrackV2.models.vggt4track.models.aggregator import Aggregator
+ from models.SpaTrackV2.models.vggt4track.heads.camera_head import CameraHead
+ from models.SpaTrackV2.models.vggt4track.heads.dpt_head import DPTHead
+-from models.SpaTrackV2.models.vggt4track.heads.track_head import TrackHead
++from models.SpaTrackV2.models.vggt4track.heads.track_head import TrackHead  # 此类内未实例化，仅 import 保留
+ from models.SpaTrackV2.models.vggt4track.utils.loss import compute_loss
+ from models.SpaTrackV2.models.vggt4track.utils.pose_enc import pose_encoding_to_extri_intri
+ from models.SpaTrackV2.models.tracker3D.spatrack_modules.utils import depth_to_points_colmap, get_nth_visible_time_index
+@@ -19,12 +38,28 @@ from models.SpaTrackV2.models.vggt4track.utils.load_fn import preprocess_image
+ from einops import rearrange
+ import torch.nn.functional as F
+ 
++
++# ============================================================
++# VGGT4Track —— 论文 §3.1 描述的“前端 (Front-end)”整体打包：
++#   输入：一段视频 (B, T, 3, H, W)，像素 ∈ [0,1]
++#   输出：consistent video depth、camera pose (9D enc → extrinsics + intrinsics)、
++#         camera 系下的 point map (B*T, H, W, 3) 以及 depth 置信度。
++#   后端 SyncFormer (TrackRefiner3D) 会消费这些输出做 Joint Motion Optimization。
++# ============================================================
+ class VGGT4Track(nn.Module, PyTorchModelHubMixin):
+     def __init__(self, img_size=518, patch_size=14, embed_dim=1024):
+         super().__init__()
+ 
++        # Temporal Encoder：把 (B,S,3,H,W) 编码成多层 token list。
++        # 输出 token 维度 = embed_dim（默认 1024，对应 dinov2-vitl）。
+         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
++
++        # CameraHead 与 DPTHead 输入维度是 2*embed_dim：因为 aggregator 把
++        # "frame attention" 和 "global attention" 两路中间特征沿通道维拼接后输出。
+         self.camera_head = CameraHead(dim_in=2 * embed_dim)
++
++        # DPT head 的 output_dim=2 = [depth(1ch), conf(1ch)]；
++        # activation="exp" 使深度恒正，conf_activation="sigmoid" 把置信度压到 (0,1)。
+         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="sigmoid")
+ 
+     def forward(
+@@ -61,62 +96,95 @@ class VGGT4Track(nn.Module, PyTorchModelHubMixin):
+ 
+         # If without batch dimension, add it
+         B, T, C, H, W = images.shape
++
++        # ── Step 1：图像预处理 ────────────────────────────────────────────
++        # preprocess_image (utils/load_fn.py) 把每张图 resize 到长边 518 且长宽都是 14 的倍数，
++        # 这是 patch_size=14 的 DINOv2 patch embed 的硬性要求。
++        # H_proc/W_proc 可能与原始 H/W 不同，最后会再 interpolate 回 (H, W)。
+         images_proc = preprocess_image(images.view(B*T, C, H, W).clone())
+         images_proc = rearrange(images_proc, '(b t) c h w -> b t c h w', b=B, t=T)
+         _, _, _, H_proc, W_proc = images_proc.shape
+ 
+         if len(images.shape) == 4:
+             images = images.unsqueeze(0)
+-        
++
++        # ── Step 2：Temporal Encoder 前向 ───────────────────────────────
++        # 调用 Aggregator.forward (aggregator.py)，输出：
++        #   aggregated_tokens_list: List[Tensor]，每层一个 (B, S, P, 2*C)，
++        #       其中 P = 1(camera) + num_register + H/14 * W/14；
++        #   patch_start_idx: int，patch token 在 P 维上的起始索引（跳过 camera + register）。
++        # 用 no_grad 包住：前端 aggregator 在 stage-1 训练完后通常冻结，
++        # 后面 camera_head / depth_head 才有梯度（见下 autocast 块）。
+         with torch.no_grad():
+             aggregated_tokens_list, patch_start_idx = self.aggregator(images_proc)
+ 
+         predictions = {}
+ 
++        # 关闭 amp.autocast：camera_head / depth_head 用全精度（论文里强调 DPT 和 cam tracker
++        # 用 FP32 保稳定，对应 README/§3.3 Stage-1 的训练细节）。
+         with torch.cuda.amp.autocast(enabled=False):
+             if self.camera_head is not None:
++                # CameraHead.forward (heads/camera_head.py)：取最后一层 token[:,:,0]（即 camera token），
++                # 迭代 4 次细化 → 返回一个 list，每一项 (B,S,9) 是激活后的 [T(3), quat(4), FoV(2)]。
+                 pose_enc_list = self.camera_head(aggregated_tokens_list)
+-                predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration
+-                predictions["pose_enc_list"] = pose_enc_list
++                predictions["pose_enc"] = pose_enc_list[-1]  # 最后一次迭代的位姿编码（最终输出）
++                predictions["pose_enc_list"] = pose_enc_list  # 中间迭代的列表（训练时算逐步监督 loss）
+ 
+             if self.depth_head is not None:
++                # DPTHead.forward (heads/dpt_head.py)：从 aggregated_tokens_list 中
++                # 抽取 [4,11,17,23] 这 4 层 patch tokens 做多尺度 DPT 融合，输出 (depth, conf)。
++                # depth shape: (B, S, H_proc, W_proc, 1)；conf 同形状。
+                 depth, depth_conf = self.depth_head(
+                     aggregated_tokens_list, images=images_proc, patch_start_idx=patch_start_idx
+                 )
+                 predictions["depth"] = depth
+                 predictions["unc_metric"] = depth_conf.view(B*T, H_proc, W_proc)
+ 
+-        predictions["images"] = (images)*255.0
+-                                                         
+-        # output the camera pose
++        predictions["images"] = (images)*255.0  # 反归一化到 [0,255]，下游可视化用
++
++        # ── Step 3：把 9D 位姿编码 → 4x4 相机矩阵 + 3x3 内参矩阵 ─────────
++        # 初始化 poses_pred 为单位阵 (T,4,4)，再把 pose_encoding_to_extri_intri
++        # (utils/pose_enc.py) 返回的 [R|t] 写到 [:3,:4]；intrs 直接得到 (T,3,3)。
+         predictions["poses_pred"] = torch.eye(4)[None].repeat(T, 1, 1)[None]
+-        predictions["poses_pred"][:,:,:3,:4], predictions["intrs"] = pose_encoding_to_extri_intri(predictions["pose_enc_list"][-1],
+-                                                                                                                     images_proc.shape[-2:])
++        predictions["poses_pred"][:,:,:3,:4], predictions["intrs"] = pose_encoding_to_extri_intri(
++            predictions["pose_enc_list"][-1],
++            images_proc.shape[-2:])
++        # 该函数解码得到的是 world→camera 的 extrinsic，inverse 得到 c2w（camera→world）。
+         predictions["poses_pred"] = torch.inverse(predictions["poses_pred"])
+ 
++        # ── Step 4：可选——用滑窗中上一段的 fx/fy 修正当前段的焦距估计 ─
++        # 用于流式 (sliding window) 推理时让相邻段的内参连续，避免段间跳变。
+         if fx_prev is not None:
+             scale_x = torch.from_numpy(fx_prev).to(predictions["intrs"].device) / predictions["intrs"][0, :fx_prev.shape[0], 0, 0]
+-            scale_x = scale_x.mean() * W_proc / W 
++            scale_x = scale_x.mean() * W_proc / W
+             predictions["intrs"][:, :, 0, 0] *= scale_x
+         if fy_prev is not None:
+             scale_y = torch.from_numpy(fy_prev).to(predictions["intrs"].device) / predictions["intrs"][0, :fy_prev.shape[0], 1, 1]
+             scale_y = scale_y.mean() * H_proc / H
+             predictions["intrs"][:, :, 1, 1] *= scale_y
+ 
+-        # get the points map
++        # ── Step 5：depth → camera 系 point map ──────────────────────────
++        # depth_to_points_colmap (tracker3D/spatrack_modules/utils.py)：
++        # 用 colmap 约定的内参把 dense depth 反投影成 (B*T, H_proc, W_proc, 3) 的 3D 点云。
+         points_map = depth_to_points_colmap(depth.view(B*T, H_proc, W_proc), predictions["intrs"].view(B*T, 3, 3))
+         predictions["points_map"] = points_map
+-        #NOTE: resize back
++        #NOTE: 把 point map 和 conf 从处理分辨率插值回原始分辨率 (H, W)。
+         predictions["points_map"] = F.interpolate(points_map.permute(0,3,1,2),
+                                                          size=(H, W), mode='bilinear', align_corners=True).permute(0,2,3,1)
+ 
+         predictions["unc_metric"] = F.interpolate(predictions["unc_metric"][:,None],
+                                                          size=(H, W), mode='bilinear', align_corners=True)[:,0]
+-        predictions["intrs"][..., :1, :] *= W/W_proc 
+-        predictions["intrs"][..., 1:2, :] *= H/H_proc 
+-
++        # intrs 也要按 W/W_proc, H/H_proc 拉伸（fx, cx 沿 W；fy, cy 沿 H）。
++        predictions["intrs"][..., :1, :] *= W/W_proc
++        predictions["intrs"][..., 1:2, :] *= H/H_proc
++
++        # ── Step 6：训练时计算 loss ──────────────────────────────────────
++        # compute_loss (utils/loss.py) 组合了：
++        #   global affine-invariant depth loss, edge, normal, consistency,
++        #   scale/shift, pose loss（对每个 pose_enc_list 迭代加权）, mask l2。
++        # 详细策略对应论文 §3.3 中 RGB-D / pose-only 数据集差异化 loss。
+         if self.training:
+             loss = compute_loss(predictions, annots)
+             predictions["loss"] = loss
+-                                                                                   
++
+         return predictions
+diff --git a/models/SpaTrackV2/models/vggt4track/utils/geometry.py b/models/SpaTrackV2/models/vggt4track/utils/geometry.py
+index 8ebd25d..812963a 100644
+--- a/models/SpaTrackV2/models/vggt4track/utils/geometry.py
++++ b/models/SpaTrackV2/models/vggt4track/utils/geometry.py
+@@ -9,6 +9,17 @@ import torch
+ import numpy as np
+ 
+ 
++# ============================================================
++# 仅在“离线 / 评测”路径下使用的几何工具，主前向 forward 不调用它：
++#   unproject_depth_map_to_point_map: 批量把 (S,H,W) depth + 内外参 → (S,H,W,3) world points。
++#   depth_to_world_coords_points:     单帧版（依赖下面的 cam-coord 与 inverse-SE3）。
++#   depth_to_cam_coords_points:       单帧 depth + 内参 → camera 系 (H,W,3)（与 colmap 版相对应，numpy 实现）。
++#   closed_form_inverse_se3:          批量 4x4 SE(3) 求逆（同时支持 numpy / torch）。
++# 注意：主路径 forward 用的是 tracker3D/spatrack_modules/utils.py 里的 depth_to_points_colmap (torch 版)，
++# 而本文件是 numpy 版评测/可视化辅助。
++# ============================================================
++
++
+ def unproject_depth_map_to_point_map(
+     depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray
+ ) -> np.ndarray:
+diff --git a/models/SpaTrackV2/models/vggt4track/utils/load_fn.py b/models/SpaTrackV2/models/vggt4track/utils/load_fn.py
+index da646c6..e660a3a 100644
+--- a/models/SpaTrackV2/models/vggt4track/utils/load_fn.py
++++ b/models/SpaTrackV2/models/vggt4track/utils/load_fn.py
+@@ -9,6 +9,17 @@ from PIL import Image
+ from torchvision import transforms as TF
+ 
+ 
++# ============================================================
++# 图像预处理。被 ../models/vggt_moe.py 的 forward 在第一步调用 (preprocess_image)。
++# 目标：所有图被 resize 到 长边 518 且 H、W 都是 14 的倍数（DINOv2-ViT-L/14 的 patch_size=14 要求）。
++# 两种模式：
++#   mode="crop" → 把宽度强制设为 518，高度等比缩放后中心裁剪到 ≤518；
++#   mode="pad"  → 较长边设为 518，较短边 padding 到 518，结果是 518x518 方图。
++# load_and_preprocess_images：从磁盘读图 + 上述预处理（demo/inference 入口）。
++# preprocess_image：直接对已经是 (C,H,W) 或 (T,C,H,W) 的张量做同样处理（被 forward 内部用）。
++# ============================================================
++
++
+ def load_and_preprocess_images(image_path_list, mode="crop"):
+     """
+     A quick start function to load and preprocess images for model input.
+@@ -147,6 +158,8 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
+ 
+ def preprocess_image(img_tensor, mode="crop", target_size=518, keep_ratio=False):
+     """
++    主路径预处理：VGGT4Track.forward 在每次前向开头调用本函数。
++    与 load_and_preprocess_images 的语义一致，但跳过磁盘 IO，直接对显存中的 tensor 做 resize / pad。
+     Preprocess image tensor(s) to target size with crop or pad mode.
+     Args:
+         img_tensor (torch.Tensor): Image tensor of shape (C, H, W) or (T, C, H, W), values in [0, 1]
+diff --git a/models/SpaTrackV2/models/vggt4track/utils/loss.py b/models/SpaTrackV2/models/vggt4track/utils/loss.py
+index a5f7867..6f1c0d0 100644
+--- a/models/SpaTrackV2/models/vggt4track/utils/loss.py
++++ b/models/SpaTrackV2/models/vggt4track/utils/loss.py
+@@ -1,25 +1,41 @@
+ # This file contains the loss functions for FrontTracker
++# 训练时被 ../models/vggt_moe.py::VGGT4Track.forward 调用：
++#     if self.training: predictions["loss"] = compute_loss(predictions, annots)
++# 论文 §3.3 三类数据 (RGB-D+track / RGB-D / pose-only) 的不同损失策略，
++# 在 annots["syn_real"] 的开关下落实到这里 ——
++#   syn_real == 1 → 合成/有 GT depth：开启 depth+edge+normal+cons+scale_shift+pose+mask_l2 全套 loss；
++#   syn_real == 0 → 真实数据/弱监督：只算 ln_cons + ln_pose（即一致性 + 位姿）。
++# 注意本 repo 不发布训练代码，本文件只是 forward 中保留的“训练分支”。
+ 
+ import torch
+ import torch.nn as nn
+ import utils3d
++# ── 来自 MoGe（depth foundation）的训练 loss 工具 ──
++#   affine_invariant_global_loss: 把预测 pointmap 与 GT 用 (scale, shift) 对齐后求 L1；
++#   edge_loss / normal_loss: 用差分/法线一致性约束 dense geometry 的局部结构；
++#   mask_l2_loss: 对深度置信度做 mask 监督。
+ from models.moge.train.losses import (
+     affine_invariant_global_loss,
+-    affine_invariant_local_loss, 
++    affine_invariant_local_loss,
+     edge_loss,
+-    normal_loss, 
+-    mask_l2_loss, 
++    normal_loss,
++    mask_l2_loss,
+     mask_bce_loss,
+-    monitoring, 
++    monitoring,
+ )
+ import torch.nn.functional as F
++# 来自 SpaTrackV2 主仓库的工具：pose_enc2mat 把 7D pose annot 解成 (intrs, c2w_traj)。
+ from models.SpaTrackV2.models.utils import pose_enc2mat, matrix_to_quaternion, get_track_points, normalize_rgb
++# 后端用的同一份 depth → camera point map 函数（保证训练/推理一致）。
+ from models.SpaTrackV2.models.tracker3D.spatrack_modules.utils import depth_to_points_colmap, get_nth_visible_time_index
++# 9D pose encoding 双向转换（loss 用 extri_intri_to_pose_encoding 把 GT 编成与预测同维度）。
+ from models.SpaTrackV2.models.vggt4track.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
+ 
+ def compute_loss(predictions, annots):
+     """
+     Compute the loss for the FrontTracker model.
++    predictions: VGGT4Track.forward 中累积的字典（含 points_map / unc_metric / pose_enc_list / scale / images）。
++    annots:      训练时由 dataloader 提供，可能含有 poses_gt / depth_gt / intrs_gt / syn_real / use_extr。
+     """
+ 
+     B, T, C, H, W = predictions["images"].shape
+@@ -71,13 +87,14 @@ def compute_loss(predictions, annots):
+     else:
+         ln_msk_l2 = 0 * points_map_gt.mean()
+     
+-    # loss1: global invariant loss
++    # loss1: 全局仿射不变的 depth/pointmap 监督（对齐 scale+shift 后 L1）。
++    #        gt_metric_scale/shift 返回出来给后面 “缩放后一致性” + “scale/shift 监督” 用。
+     ln_depth_glob, _, gt_metric_scale, gt_metric_shift = affine_invariant_global_loss(predictions["points_map"], points_map_gt, gt_mask[:,0], align_resolution=32)
+     ln_depth_glob = 100*ln_depth_glob.mean()
+-    # loss2: edge loss
++    # loss2: 边缘梯度一致性（保边界细节）
+     ln_edge, _ = edge_loss(predictions["points_map"], points_map_gt, gt_mask[:,0])
+     ln_edge = ln_edge.mean()
+-    # loss3: normal loss
++    # loss3: 法线一致性（保表面朝向）
+     ln_normal, _ = normal_loss(predictions["points_map"], points_map_gt, gt_mask[:,0])
+     ln_normal = ln_normal.mean()
+     #NOTE: loss4: consistent loss
+@@ -101,7 +118,9 @@ def compute_loss(predictions, annots):
+         ln_scale_shift = 10*ln_scale_shift.mean()
+     else:
+         ln_scale_shift = 0 * ln_cons.mean()
+-    # loss6: pose loss
++    # loss6: pose loss —— 对 CameraHead 输出的每次迭代加权监督，
++    #   权重 0.8^(N-i-1)：越靠后越接近最终预测，权重越大（RAFT/CoTracker 风格）。
++    #   把 GT 的 c2w（来自 pose_enc2mat）取 inverse 得到 world→camera 与预测同方向。
+     c2w_traj_gt[...,:3, 3] /= norm_rescale
+     ln_pose = 0
+     for i_t, pose_enc_i in enumerate(predictions["pose_enc_list"]):
+@@ -109,9 +128,13 @@ def compute_loss(predictions, annots):
+         T_loss = torch.abs(pose_enc_i[..., :3] - pose_enc_gt[..., :3]).mean()
+         R_loss = torch.abs(pose_enc_i[..., 3:7] - pose_enc_gt[..., 3:7]).mean()
+         K_loss = torch.abs(pose_enc_i[..., 7:] - pose_enc_gt[..., 7:]).mean()
++        # 平移 + 旋转用大权重 25，内参（FoV）用 1（论文经验权重）。
+         pose_loss_i = 25*(T_loss + R_loss) + K_loss
+         ln_pose += 0.8**(len(predictions["pose_enc_list"]) - i_t - 1)*(pose_loss_i)
+     ln_pose = 5*ln_pose
++    # 对应论文 §3.3 的“分数据集分 loss”策略：
++    #   syn_real == 1 → 合成或带 GT-depth 的数据：full supervision
++    #   syn_real == 0 → 真实视频（只有 pose 或没有 GT-depth）：仅一致性 + pose loss
+     if annots["syn_real"] == 1:
+         loss = ln_depth_glob + ln_edge + ln_normal + ln_cons + ln_scale_shift + ln_pose + ln_msk_l2
+     else:
+diff --git a/models/SpaTrackV2/models/vggt4track/utils/pose_enc.py b/models/SpaTrackV2/models/vggt4track/utils/pose_enc.py
+index 2f98b08..84568a4 100644
+--- a/models/SpaTrackV2/models/vggt4track/utils/pose_enc.py
++++ b/models/SpaTrackV2/models/vggt4track/utils/pose_enc.py
+@@ -5,9 +5,20 @@
+ # LICENSE file in the root directory of this source tree.
+ 
+ import torch
++# 跨文件依赖：./rotation.py 提供 quaternion ↔ rotation matrix（XYZW / scalar-last 约定）。
+ from .rotation import quat_to_mat, mat_to_quat
+ 
+ 
++# ============================================================
++# 9D pose encoding ⇄ (extrinsic 3x4, intrinsic 3x3) 的双向转换。
++# 调用方：
++#   * ../models/vggt_moe.py 在 forward 末尾用 pose_encoding_to_extri_intri 解码 CameraHead 输出。
++#   * ../utils/loss.py compute_loss 用 extri_intri_to_pose_encoding 把 GT 位姿编成 9D 算 loss。
++# 编码格式 "absT_quaR_FoV"：[T_x, T_y, T_z, q_x, q_y, q_z, q_w, fov_h, fov_w]
++# 注意：extrinsic 是 world→camera (OpenCV)，预测得到的 9D 也是这个方向；vggt_moe 在解码后再 inverse 得到 c2w。
++# ============================================================
++
++
+ def extri_intri_to_pose_encoding(
+     extrinsics,
+     intrinsics,
+@@ -50,8 +61,9 @@ def extri_intri_to_pose_encoding(
+         R = extrinsics[:, :, :3, :3]  # BxSx3x3
+         T = extrinsics[:, :, :3, 3]  # BxSx3
+ 
++        # 用 ./rotation.py 把 3x3 旋转矩阵转 quaternion (scalar-last)
+         quat = mat_to_quat(R)
+-        # Note the order of h and w here
++        # fov_h 用 fy 和 H 算；fov_w 用 fx 和 W 算（保证“反解”时能用 H,W 还原内参）。
+         H, W = image_size_hw
+         fov_h = 2 * torch.atan((H / 2) / intrinsics[..., 1, 1])
+         fov_w = 2 * torch.atan((W / 2) / intrinsics[..., 0, 0])
+@@ -111,10 +123,12 @@ def pose_encoding_to_extri_intri(
+         fov_h = pose_encoding[..., 7]
+         fov_w = pose_encoding[..., 8]
+ 
++        # quat → 3x3 旋转矩阵；拼上 T 得到 [R|t] (B,S,3,4)
+         R = quat_to_mat(quat)
+         extrinsics = torch.cat([R, T[..., None]], dim=-1)
+ 
+         if build_intrinsics:
++            # FoV → 焦距 fx, fy；主点假设位于图像中心 (W/2, H/2)。
+             H, W = image_size_hw
+             fy = (H / 2.0) / torch.tan(fov_h / 2.0)
+             fx = (W / 2.0) / torch.tan(fov_w / 2.0)
+diff --git a/models/SpaTrackV2/models/vggt4track/utils/rotation.py b/models/SpaTrackV2/models/vggt4track/utils/rotation.py
+index 657583e..ba578b4 100644
+--- a/models/SpaTrackV2/models/vggt4track/utils/rotation.py
++++ b/models/SpaTrackV2/models/vggt4track/utils/rotation.py
+@@ -11,6 +11,13 @@ import numpy as np
+ import torch.nn.functional as F
+ 
+ 
++# ============================================================
++# Quaternion ↔ 3x3 Rotation Matrix (scalar-last, XYZW)。
++# 调用方：./pose_enc.py。约定与 PyTorch3D 一致，但本仓库用 “scalar-last” 而非默认的 “scalar-first”。
++# 内部 _sqrt_positive_part 和 standardize_quaternion 用来处理数值边界和符号歧义。
++# ============================================================
++
++
+ def quat_to_mat(quaternions: torch.Tensor) -> torch.Tensor:
+     """
+     Quaternion Order: XYZW or say ijkr, scalar-last

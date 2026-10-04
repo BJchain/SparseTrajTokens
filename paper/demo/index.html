@@ -1,0 +1,413 @@
+<title>Trajectory Demo Reel</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#F6F7F9; --surface:#FFFFFF; --surface-2:#EEF0F3; --line:#D5D9DF; --fg:#1A1A1A; --muted:#5F6368;
+  --accent:#1F76D6; --accent-soft:#EEF5FC; --base-soft:#F4F4F4; --base-line:#BDBDBD;
+  --ok:#2CA02C; --bad:#D62728; --tag-e:#A33B2B; --tag-a:#2E7D32;
+  --stage:#0B0D12; --stage-fg:#E8EAF0; --stage-line:#2A2F3A;
+  --sans:"IBM Plex Sans","Helvetica Neue",Arial,sans-serif; --mono:"IBM Plex Mono","Liberation Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0F1115; --surface:#171A21; --surface-2:#1F232C; --line:#2C313C; --fg:#E6E8EE; --muted:#9AA3B2;
+    --accent:#5B9CF6; --accent-soft:#14233A; --base-soft:#1C1F26; --base-line:#3A3F4B;
+    --ok:#4CC24C; --bad:#F05A5A; --tag-e:#E07A6A; --tag-a:#5ECC6A;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0F1115; --surface:#171A21; --surface-2:#1F232C; --line:#2C313C; --fg:#E6E8EE; --muted:#9AA3B2;
+  --accent:#5B9CF6; --accent-soft:#14233A; --base-soft:#1C1F26; --base-line:#3A3F4B;
+  --ok:#4CC24C; --bad:#F05A5A; --tag-e:#E07A6A; --tag-a:#5ECC6A;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--sans);-webkit-font-smoothing:antialiased}
+body.has-focus{overflow:hidden}
+.wrap{max-width:1360px;margin-inline:auto;padding-inline:16px;padding-block:0 40px}
+h1,h2,h3,h4{margin:0;text-wrap:balance;line-height:1.25}
+p{margin:0}
+button{font:inherit;color:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ---------- top: title + sticky controls ---------- */
+.top{padding-block:28px 16px;display:grid;gap:8px;max-width:72ch}
+.top h1{font-size:26px;font-weight:600;letter-spacing:-.01em}
+.top .lede{color:var(--muted);font-size:14.5px}
+.controls{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px;display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin-bottom:20px}
+.ctl{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ctl>span.lab{font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:500}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--surface)}
+.seg button{background:transparent;color:var(--muted);padding:5px 10px;border:0;border-right:1px solid var(--line);font-size:13px;line-height:1.3}
+.seg button:last-child{border-right:0}
+.seg button[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.btn{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:5px 11px;font-size:13px;line-height:1.3}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.btn:hover{border-color:var(--accent)}
+.chk{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+.legend-time{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+.rainbow{width:120px;height:10px;border-radius:5px;
+  background:linear-gradient(90deg,hsl(281 100% 50%) 0%,hsl(240 100% 50%) 14.5%,hsl(180 100% 50%) 35.9%,hsl(120 100% 50%) 57.3%,hsl(60 100% 50%) 78.6%,hsl(0 100% 50%) 100%)}
+
+/* ---------- grid of clip cards ---------- */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(370px,100%),1fr));gap:20px;align-items:start}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px;display:grid;gap:12px;min-width:0}
+.card-head{display:grid;grid-template-columns:1fr auto;gap:4px 10px;align-items:start}
+.card-head h2{font-size:17px;font-weight:600}
+.meta{grid-column:1 / -1;display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;font-size:12px;color:var(--muted)}
+.chip{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:1px 8px;font-size:11.5px;color:var(--muted);background:var(--surface-2)}
+.chip.split{color:var(--accent);border-color:transparent;background:var(--accent-soft);font-weight:500}
+.stage{position:relative;aspect-ratio:1;max-width:100%;overflow:hidden;border-radius:8px;background:var(--stage);border:1px solid var(--stage-line)}
+.stage video{position:absolute;width:200%;height:200%;left:calc(var(--qx) * -100%);top:calc(var(--qy) * -100%);display:block}
+.stage[data-layer="input"] video{--qx:0;--qy:0}
+.stage[data-layer="masks"] video{--qx:1;--qy:0}
+.stage[data-layer="traj"] video{--qx:0;--qy:1}
+.stage[data-layer="both"] video{--qx:1;--qy:1}
+.stage .poster{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.hud,.layer-tag{position:absolute;font:500 12px/1 var(--mono);color:var(--stage-fg);background:rgba(11,13,18,.72);padding:6px 8px;border-radius:6px;letter-spacing:.02em;font-variant-numeric:tabular-nums;pointer-events:none}
+.hud{right:8px;bottom:8px}
+.layer-tag{left:8px;top:8px;font-family:var(--sans);font-weight:500}
+.bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.bar .btn{padding:4px 9px;min-width:34px;text-align:center}
+.bar .btn.play{min-width:64px}
+.tl-wrap{position:relative;height:26px;flex:1 1 160px;min-width:120px}
+.tl-track{position:absolute;left:7px;right:7px;top:11px;height:4px;background:var(--line);border-radius:2px}
+.tl-band{position:absolute;top:0;height:100%;background:var(--accent);border-radius:2px}
+.tl-tick{position:absolute;top:-4px;width:2px;height:12px;background:var(--muted);transform:translateX(-1px);opacity:.8}
+input[type=range].tl{-webkit-appearance:none;appearance:none;position:absolute;inset:0;width:100%;height:26px;margin:0;background:transparent;z-index:2}
+input[type=range].tl::-webkit-slider-runnable-track{height:26px;background:transparent}
+input[type=range].tl::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--fg);border:2px solid var(--surface);box-shadow:0 0 0 1px var(--line);margin-top:6px}
+input[type=range].tl::-moz-range-track{height:26px;background:transparent}
+input[type=range].tl::-moz-range-thumb{width:10px;height:10px;border-radius:50%;background:var(--fg);border:2px solid var(--surface);box-shadow:0 0 0 1px var(--line)}
+.interval{font-size:12px;color:var(--muted)}
+.interval b{color:var(--accent);font-weight:600}
+
+.legend{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:6px}
+.legend li{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:2px 9px 2px 6px;font-size:12.5px;background:var(--surface)}
+.legend li i{width:11px;height:11px;border-radius:50%;display:inline-block;border:1px solid rgba(0,0,0,.15)}
+.legend li .mono{color:var(--muted);font-size:11.5px}
+.legend li em{font-style:normal;color:var(--muted);font-size:11px}
+.legend li em.warn{color:var(--tag-e)}
+.legend li.more{cursor:pointer;color:var(--accent);border-style:dashed}
+.legend li[hidden]{display:none}
+
+.qa{display:grid;gap:10px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:12px}
+.qa .eyebrow{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:500}
+.qa .eyebrow .ra{color:var(--tag-a);text-transform:none;letter-spacing:0;font-size:13px;font-weight:600}
+.qa .question{font-size:14.5px}
+.qa .question .obj{font-weight:600}
+.opts{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13.5px;align-items:baseline}
+.opts .opt.ok{color:var(--tag-a);font-weight:600}
+.opts .gt{color:var(--muted);font-size:12.5px;margin-left:auto}
+.panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:8px}
+.panel{border:1px solid var(--base-line);background:var(--base-soft);border-radius:8px;padding:9px 10px;min-width:0}
+.panel.ours{border-color:var(--accent);background:var(--accent-soft)}
+.panel h4{font-size:12.5px;font-weight:600;margin-bottom:6px}
+.out{margin:0;font:12.5px/1.5 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;color:var(--fg)}
+.out .tag-e{color:var(--tag-e)}
+.out .tag-a{color:var(--tag-a)}
+.out .mark{font-family:var(--sans);font-weight:600;font-size:12px;margin-left:6px}
+.out .mark.ok{color:var(--ok)}
+.out .mark.bad{color:var(--bad)}
+.zs{font-size:12.5px;color:var(--muted)}
+.zs b{color:var(--fg)}
+.zs .mark.ok{color:var(--ok)} .zs .mark.bad{color:var(--bad)}
+details.caption{border-top:1px solid var(--line);padding-top:8px;font-size:13px}
+details.caption summary{cursor:pointer;color:var(--muted);font-size:12.5px}
+details.caption p{margin-top:6px;color:var(--fg)}
+details.caption b{font-weight:600}
+
+/* ---------- focus mode (one clip, large) ---------- */
+.card.focus{position:fixed;inset:0;z-index:40;border-radius:0;border:0;overflow:auto;padding:16px;padding-top:calc(16px + env(safe-area-inset-top,0px));
+  background:var(--bg);grid-template-columns:minmax(0,1.35fr) minmax(min(320px,100%),.9fr);grid-template-rows:auto auto auto auto 1fr;gap:12px 20px;align-content:start}
+.card.focus .card-head{grid-column:1 / -1}
+.card.focus .stage{grid-column:1;grid-row:2;width:min(100%,calc(100vh - 230px));min-width:min(100%,280px);margin-inline:auto}
+.card.focus .bar{grid-column:1;grid-row:3;width:min(100%,calc(100vh - 230px));margin-inline:auto}
+.card.focus .legend{grid-column:1;grid-row:4;width:min(100%,calc(100vh - 230px));margin-inline:auto}
+.card.focus .qa{grid-column:2;grid-row:2 / span 3;align-self:start}
+.card.focus details.caption{grid-column:2;grid-row:5;align-self:start;border-top:0;padding-top:0}
+.card.focus .card-head h2{font-size:22px}
+.focus-nav{display:none;gap:8px;align-items:center;flex-wrap:wrap}
+.card.focus .focus-nav{display:flex}
+.card.focus .expand{display:none}
+.keys{font-size:12px;color:var(--muted)}
+.keys kbd{font:11.5px var(--mono);border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;background:var(--surface)}
+@media (max-width:900px){
+  .card.focus{grid-template-columns:1fr;grid-template-rows:none;display:block}
+  .card.focus>*{margin-bottom:12px}
+  .card.focus .stage,.card.focus .bar,.card.focus .legend{width:100%}
+}
+
+/* ---------- footer notes ---------- */
+.notes{margin-top:36px;max-width:78ch;display:grid;gap:8px;font-size:13.5px;color:var(--muted)}
+.notes h3{font-size:14px;color:var(--fg);font-weight:600}
+.notes ul{margin:0;padding-left:18px;display:grid;gap:4px}
+.notes code{font:12.5px var(--mono);color:var(--fg)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <h1>Trajectory Demo Reel</h1>
+    <p class="lede">Nine Stereo4D clips from the qualitative figures (Fig. 4 and Fig. 4b), with what the data pipeline extracts drawn into every frame: the outline of each moving object and the world-frame trajectory of its keypoints, projected with the ground-truth camera. Trajectory colour is time, violet at the start and red at the end. Each clip is paired with the TrajQA-B question used in the figure and the verbatim outputs of both models.</p>
+  </header>
+
+  <div class="controls" id="controls">
+    <div class="ctl"><span class="lab">Layer</span>
+      <div class="seg" id="g-layer" role="group" aria-label="Layer for all clips">
+        <button type="button" data-layer="input" aria-pressed="false">Input</button>
+        <button type="button" data-layer="masks" aria-pressed="false">Masks</button>
+        <button type="button" data-layer="traj" aria-pressed="false">Trajectories</button>
+        <button type="button" data-layer="both" aria-pressed="true">Masks + trajectories</button>
+      </div>
+    </div>
+    <div class="ctl"><span class="lab">Speed</span>
+      <div class="seg" id="g-speed" role="group" aria-label="Playback speed">
+        <button type="button" data-speed="0.5" aria-pressed="false">0.5×</button>
+        <button type="button" data-speed="1" aria-pressed="true">1×</button>
+        <button type="button" data-speed="2" aria-pressed="false">2×</button>
+      </div>
+    </div>
+    <div class="ctl">
+      <button type="button" class="btn primary" id="g-play">Play all</button>
+      <button type="button" class="btn" id="g-pause">Pause all</button>
+      <button type="button" class="btn" id="g-restart">Restart all</button>
+      <label class="chk"><input type="checkbox" id="g-loop" checked> Loop</label>
+    </div>
+    <div class="legend-time"><span>start</span><span class="rainbow" aria-hidden="true"></span><span>end</span><span>· trajectory colour = time</span></div>
+  </div>
+
+  <main class="grid" id="grid"></main>
+
+  <section class="notes">
+    <h3>About these renders</h3>
+    <ul>
+      <li><b>Masks</b> come from SAM 3 re-run with the production settings. Outlines are drawn for the moving objects only; static objects stay unmarked.</li>
+      <li><b>Trajectories</b> are the down-sampled keypoints of the production final representation, in the world frame, projected into each frame with the ground-truth camera. Non-rigid keypoints are drawn only while visible; rigid ones only where the SE(3) fit is valid. On a moving camera a world-frame path looks stretched in the image, which is expected.</li>
+      <li>Every frame is the same render the paper figures use. The script that made these videos re-draws the figure frames and checks them pixel for pixel against the figure files.</li>
+      <li>Videos play at each clip's real sampling rate (5 fps for eight clips, 15 fps for Carried object), so the motion on screen matches the metres per second in the questions. The highlighted band on the timeline is the interval the question asks about; the small ticks are the frames printed in the paper figure.</li>
+      <li>Questions come from the evaluation splits (test and held-out test). Both fine-tuned models see 8 frames sampled uniformly over the whole clip; ours additionally reads the trajectory tokens. Zero-shot Qwen3-VL-8B answers with a letter only.</li>
+      <li>The motion caption under each clip is generated by rules from the ground-truth tracks. It is not a model output.</li>
+      <li>For the video editor: <code>paper/demo_web/videos/&lt;clip&gt;_{input,masks,traj,both,sbs,tiles}.mp4</code> (512×512 single layers, <code>sbs</code> = input | masks + trajectories side by side, <code>tiles</code> = the 2×2 sheet this page shows).</li>
+    </ul>
+  </section>
+</div>
+
+<script src="data.js"></script>
+<script>
+(function(){
+  const D = window.DEMO_DATA;
+  const LAYERS = {input:'Input frames', masks:'Masks', traj:'Trajectories', both:'Masks + trajectories'};
+  const SPLIT = {test:'test split', heldout_test:'held-out split'};
+  const FIGN = {fig4:'Fig. 4', fig4b:'Fig. 4b'};
+  const state = {layer:'both', speed:1, loop:true, focus:-1};
+  const cards = [];
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fmtGt = q => q.gt_value.toFixed(2) + ' ' + q.gt_unit;
+
+  function colorNames(text, colors){
+    // wrap object names with their outline colour; longest names first so "the man in white shirt" wins over "the man"
+    const names = Object.keys(colors).sort((a,b) => b.length - a.length);
+    if (!names.length) return esc(text);
+    const re = new RegExp(names.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'gi');
+    let out = '', last = 0, m;
+    while ((m = re.exec(text))){
+      out += esc(text.slice(last, m.index)) + '<b class="obj" style="color:' + colors[m[0].toLowerCase()] + '">' + esc(m[0]) + '</b>';
+      last = m.index + m[0].length;
+    }
+    return out + esc(text.slice(last));
+  }
+
+  function outHtml(o, q){
+    return o.lines.map(ln => {
+      if (ln === '<evidence>' || ln === '</evidence>') return '<span class="tag-e">' + esc(ln) + '</span>';
+      const m = ln.match(/^<answer>([A-D])<\/answer>$/);
+      if (m){
+        const ok = m[1] === q.answer;
+        return '<span class="tag-a">&lt;answer&gt;</span><b>' + m[1] + '</b><span class="tag-a">&lt;/answer&gt;</span>' +
+               '<span class="mark ' + (ok ? 'ok' : 'bad') + '">' + (ok ? '✓ correct' : '✗ wrong') + '</span>';
+      }
+      if (ln.startsWith(q.keyline)) return '<b>' + esc(ln) + '</b>';
+      return esc(ln);
+    }).join('\n');
+  }
+
+  function buildCard(c, idx){
+    const q = c.question, T = c.T, last = T - 1;
+    const colors = {};
+    c.objects.forEach(o => { const n = 'the ' + o.label; if (!(n in colors)) colors[n] = o.color; });
+    const qColors = q.obj ? {[q.obj]: q.obj_color} : {};
+    const el = document.createElement('article');
+    el.className = 'card'; el.id = 'clip-' + c.key;
+    const legendItems = c.objects.map((o, i) =>
+      '<li' + (i >= 8 ? ' hidden data-extra="1"' : '') + '><i style="background:' + o.color + '"></i>' + esc(o.label) +
+      '<span class="mono">' + o.n_keypoints + ' kp</span><em>' + (o.kind === 'rigid' ? 'rigid' : 'non-rigid') + '</em>' +
+      (o.mask_matched ? '' : '<em class="warn">trajectory only</em>') + '</li>').join('') +
+      (c.objects.length > 8 ? '<li class="more" role="button" tabindex="0">show all ' + c.objects.length + '</li>' : '');
+    const ticks = c.paper_frames.map(t => '<span class="tl-tick" style="left:' + (100 * t / last).toFixed(2) + '%" title="frame ' + t + ' in the paper figure"></span>').join('');
+    const band = '<span class="tl-band" style="left:' + (100 * q.i / last).toFixed(2) + '%;width:' + (100 * (q.j - q.i) / last).toFixed(2) + '%"></span>';
+    const opts = Object.keys(q.options).sort().map(L =>
+      '<span class="opt' + (L === q.answer ? ' ok' : '') + '">' + L + '. ' + esc(q.options[L]) + '</span>').join('') +
+      '<span class="gt">ground truth ' + fmtGt(q) + '</span>';
+    const zs = c.outputs.qwen_zs;
+    el.innerHTML =
+      '<header class="card-head">' +
+        '<h2>' + esc(c.name) + '</h2>' +
+        '<div class="focus-nav">' +
+          '<button type="button" class="btn prev">‹ Prev clip</button><button type="button" class="btn next">Next clip ›</button>' +
+          '<button type="button" class="btn close">Close</button>' +
+          '<span class="keys"><kbd>Space</kbd> play · <kbd>←</kbd><kbd>→</kbd> step · <kbd>1</kbd>–<kbd>4</kbd> layer · <kbd>[</kbd><kbd>]</kbd> clip · <kbd>Esc</kbd> close</span>' +
+        '</div>' +
+        '<button type="button" class="btn expand">Expand</button>' +
+        '<div class="meta"><span class="chip split">' + SPLIT[c.split] + '</span><span class="chip">' + FIGN[c.fig] + '</span>' +
+          '<span class="mono">' + esc(c.clip) + '</span><span>' + T + ' frames · ' + c.fps + ' fps · ' + c.duration_s.toFixed(1) + ' s</span></div>' +
+      '</header>' +
+      '<div class="stage" data-layer="' + state.layer + '">' +
+        '<video muted loop autoplay playsinline preload="auto" src="' + c.videos.tiles.path + '"></video>' +
+        '<img class="poster" src="' + c.poster + '" alt="">' +
+        '<span class="layer-tag">' + LAYERS[state.layer] + '</span><span class="hud">t = 0 / ' + last + ' · 0.0 s</span>' +
+      '</div>' +
+      '<div class="bar">' +
+        '<button type="button" class="btn play">Play</button>' +
+        '<button type="button" class="btn back" aria-label="previous frame">‹</button>' +
+        '<div class="tl-wrap"><div class="tl-track">' + band + ticks + '</div>' +
+          '<input class="tl" type="range" min="0" max="' + last + '" step="1" value="0" id="tl-' + c.key + '" aria-label="frame"></div>' +
+        '<button type="button" class="btn fwd" aria-label="next frame">›</button>' +
+        '<div class="seg layers" role="group" aria-label="Layer">' +
+          Object.keys(LAYERS).map(k => '<button type="button" data-layer="' + k + '" aria-pressed="' + (k === state.layer) + '">' +
+            ({input:'Input',masks:'Masks',traj:'Traj.',both:'Both'})[k] + '</button>').join('') +
+        '</div>' +
+        '<span class="interval">asked interval: frames <b>' + q.i + '–' + q.j + '</b></span>' +
+      '</div>' +
+      '<ul class="legend">' + legendItems + '</ul>' +
+      '<section class="qa">' +
+        '<div class="eyebrow"><span>TrajQA-B question · ' + SPLIT[c.split] + '</span><span class="ra">Right answer: ' + q.answer + '</span></div>' +
+        '<p class="question">' + colorNames(q.text, qColors) + '</p>' +
+        '<div class="opts">' + opts + '</div>' +
+        '<div class="panels">' +
+          '<section class="panel base"><h4>' + esc(D.models.rgb) + '</h4><pre class="out">' + outHtml(c.outputs.rgb, q) + '</pre></section>' +
+          '<section class="panel ours"><h4>' + esc(D.models.ours) + '</h4><pre class="out">' + outHtml(c.outputs.ours, q) + '</pre></section>' +
+        '</div>' +
+        '<p class="zs">Zero-shot Qwen3-VL-8B (letter only): <b>' + esc(zs.letter) + '</b> <span class="mark ' + (zs.correct ? 'ok' : 'bad') + '">' + (zs.correct ? '✓' : '✗') + '</span></p>' +
+      '</section>' +
+      '<details class="caption"><summary>Motion caption generated by rules from the ground-truth tracks (not a model output)</summary>' +
+        c.captions.map(s => '<p>' + colorNames(s, colors) + '</p>').join('') +
+      '</details>';
+
+    const k = {c, el, idx, frame:-1, playing:null,
+      video: el.querySelector('video'), poster: el.querySelector('.poster'), stage: el.querySelector('.stage'),
+      hud: el.querySelector('.hud'), tag: el.querySelector('.layer-tag'), range: el.querySelector('input.tl'),
+      playBtn: el.querySelector('.play'), layerBtns: [...el.querySelectorAll('.layers button')]};
+    const v = k.video;
+    v.muted = true; v.loop = state.loop; v.playbackRate = state.speed;
+    const hidePoster = () => { k.poster.hidden = true; };
+    v.addEventListener('loadeddata', hidePoster); v.addEventListener('playing', hidePoster);
+    v.addEventListener('error', () => { k.hud.textContent = 'video failed to load'; });
+    k.playBtn.addEventListener('click', () => togglePlay(k));
+    el.querySelector('.back').addEventListener('click', () => step(k, -1));
+    el.querySelector('.fwd').addEventListener('click', () => step(k, 1));
+    k.range.addEventListener('input', e => seekFrame(k, Number(e.target.value)));
+    k.layerBtns.forEach(b => b.addEventListener('click', () => setLayer(k, b.dataset.layer)));
+    el.querySelector('.expand').addEventListener('click', () => openFocus(idx));
+    k.stage.addEventListener('dblclick', () => { if (state.focus < 0) openFocus(idx); });
+    el.querySelector('.close').addEventListener('click', closeFocus);
+    el.querySelector('.prev').addEventListener('click', () => openFocus((idx + cards.length - 1) % cards.length));
+    el.querySelector('.next').addEventListener('click', () => openFocus((idx + 1) % cards.length));
+    const more = el.querySelector('.legend .more');
+    if (more){
+      const show = () => { el.querySelectorAll('.legend li[data-extra]').forEach(li => { li.hidden = false; }); more.remove(); };
+      more.addEventListener('click', show);
+      more.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); show(); } });
+    }
+    return k;
+  }
+
+  function seekFrame(k, f){
+    f = Math.max(0, Math.min(k.c.T - 1, f));
+    k.video.pause();
+    k.video.currentTime = (f + 0.5) / k.c.fps;
+    updateHud(k, f);
+  }
+  function step(k, d){ seekFrame(k, (k.frame < 0 ? 0 : k.frame) + d); }
+  function togglePlay(k){ if (k.video.paused) k.video.play().catch(() => {}); else k.video.pause(); }
+  function setLayer(k, layer){
+    k.stage.dataset.layer = layer; k.tag.textContent = LAYERS[layer];
+    k.layerBtns.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.layer === layer)));
+  }
+  function updateHud(k, f){
+    if (f === k.frame) return;
+    k.frame = f;
+    k.hud.textContent = 't = ' + f + ' / ' + (k.c.T - 1) + ' · ' + (f / k.c.fps).toFixed(1) + ' s';
+    k.range.value = f;
+  }
+  function tick(){
+    for (const k of cards){
+      const v = k.video;
+      const f = Math.min(k.c.T - 1, Math.max(0, Math.floor(v.currentTime * k.c.fps + 1e-3)));
+      updateHud(k, f);
+      const playing = !v.paused && !v.ended;
+      if (playing !== k.playing){ k.playing = playing; k.playBtn.textContent = playing ? 'Pause' : 'Play'; }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  // ---- global controls
+  const gLayer = document.getElementById('g-layer'), gSpeed = document.getElementById('g-speed');
+  function pressOnly(group, attr, value){
+    group.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset[attr] === value)));
+  }
+  gLayer.addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    state.layer = b.dataset.layer; pressOnly(gLayer, 'layer', state.layer);
+    cards.forEach(k => setLayer(k, state.layer));
+  });
+  gSpeed.addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    state.speed = Number(b.dataset.speed); pressOnly(gSpeed, 'speed', b.dataset.speed);
+    cards.forEach(k => { k.video.playbackRate = state.speed; });
+  });
+  document.getElementById('g-play').addEventListener('click', () => cards.forEach(k => k.video.play().catch(() => {})));
+  document.getElementById('g-pause').addEventListener('click', () => cards.forEach(k => k.video.pause()));
+  document.getElementById('g-restart').addEventListener('click', () => cards.forEach(k => { k.video.currentTime = 0; k.video.play().catch(() => {}); }));
+  document.getElementById('g-loop').addEventListener('change', e => { state.loop = e.target.checked; cards.forEach(k => { k.video.loop = state.loop; }); });
+
+  // ---- focus mode
+  function openFocus(i){
+    if (state.focus >= 0) cards[state.focus].el.classList.remove('focus');
+    state.focus = i;
+    cards[i].el.classList.add('focus');
+    document.body.classList.add('has-focus');
+    cards[i].el.scrollTop = 0;
+    cards[i].el.querySelector('.close').focus({preventScroll:true});
+  }
+  function closeFocus(){
+    if (state.focus < 0) return;
+    const k = cards[state.focus];
+    k.el.classList.remove('focus'); document.body.classList.remove('has-focus');
+    state.focus = -1;
+    k.el.querySelector('.expand').focus({preventScroll:true});
+  }
+  document.addEventListener('keydown', e => {
+    if (state.focus < 0) return;
+    const k = cards[state.focus];
+    const inRange = e.target === k.range;
+    if (e.key === 'Escape'){ closeFocus(); return; }
+    if (e.key === ' ' && !inRange){ e.preventDefault(); togglePlay(k); return; }
+    if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !inRange){ e.preventDefault(); step(k, e.key === 'ArrowLeft' ? -1 : 1); return; }
+    const L = {'1':'input','2':'masks','3':'traj','4':'both'}[e.key];
+    if (L){ setLayer(k, L); return; }
+    if (e.key === '[') openFocus((state.focus + cards.length - 1) % cards.length);
+    else if (e.key === ']') openFocus((state.focus + 1) % cards.length);
+  });
+
+  // ---- build
+  const grid = document.getElementById('grid');
+  D.clips.forEach((c, i) => { const k = buildCard(c, i); cards.push(k); grid.appendChild(k.el); });
+  requestAnimationFrame(tick);
+  const hash = (location.hash || '').replace('#', '');
+  if (hash){ const i = cards.findIndex(k => 'clip-' + k.c.key === hash); if (i >= 0) openFocus(i); }
+})();
+</script>

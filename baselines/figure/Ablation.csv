@@ -1,0 +1,6 @@
+arm,model,frames,traj_tokens,pred_file,n_numeric3,numeric3,heldout,test,cam_disp,obj_disp,speed,non_num
+Question only,final (joint),0,0,preds/Ours_TrajRGB-final_blind.jsonl,7500,26.8000,27.5060,26.2416,27.1871,27.0258,25.9332,49.5261
+RGB frames only,RGB-only FT,1,0,preds/Ours_RGB-arm.jsonl,7500,48.3467,47.7657,48.8061,53.6756,44.4751,43.8605,80.8057
+RGB + donor tokens (control),final (joint),1,donor,preds/Ours_TrajRGB-final_donor.jsonl,7500,29.6133,30.6461,28.7966,30.7412,28.8214,28.6346,68.9573
+RGB + trajectory tokens (full),final (joint),1,1,preds/Ours_TrajRGB-final.jsonl,7500,82.1600,81.7331,82.4976,89.4289,77.6243,75.2456,90.2844
+Trajectory tokens only (no frames),final (joint),0,1,preds/Ours_TrajRGB-final_trajonly.jsonl,7500,82.2400,81.4915,82.8319,89.3985,77.6703,75.5403,90.7583
