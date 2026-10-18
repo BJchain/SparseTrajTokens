@@ -1,6 +1,9 @@
 # Data release layout
 
-Everything below `data/` is distributed separately from the git repository (see `.gitignore`).
+Everything below `data/` is distributed separately from the git repository (see `.gitignore`), as the Hugging Face
+dataset https://huggingface.co/datasets/Chenfy0407/TrajQA-B (scenes and tokens packed as tar shards; unpacking
+instructions are in its dataset card; `MANIFEST.tsv` there lists the SHA-256 of every tar). Frames, raw videos and
+third-party data (`stereo4d/`, `external/`) are not on the Hub.
 All paths are relative to the repository root, which is also the working directory of every script.
 
 | Path | Size | Content | Produced by |

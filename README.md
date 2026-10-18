@@ -35,8 +35,11 @@ video ──► Object-Centric Track Constructor ──► Event-Aware Trajector
 | `data/` | Stereo4D raw videos, frames, 42,151 processed scenes, trajectory tokens, TrajQA-B, captions | ✗ (data release) |
 | `checkpoints/` | Released weights of the three training stages and the frames-only arm | ✗ (model release) |
 
-Everything marked ✗ is listed in `.gitignore` and distributed separately (see `data/README.md` and
-`checkpoints/README.md` for the exact layout). Paths in the code are relative to the repository root; run all
+Everything marked ✗ is listed in `.gitignore` and distributed through Hugging Face (see `data/README.md` and
+`checkpoints/README.md` for the exact layout):
+
+* dataset (TrajQA-B, processed scenes, tokens, captions, results, baseline predictions): https://huggingface.co/datasets/Chenfy0407/TrajQA-B
+* checkpoints: https://huggingface.co/Chenfy0407/SparseTrajTokens (private until the paper is public) Paths in the code are relative to the repository root; run all
 commands from there.
 
 ### Internal names ↔ paper names
@@ -151,6 +154,8 @@ All 15 baselines are in `baselines/results_table.md`. All trained-model numbers 
 
 ## Data and licences
 
-TrajQA-B and the processed scenes are derived from [Stereo4D](https://stereo4d.github.io/) (YouTube VR180 videos
-and their released 3D tracks); the raw videos are not redistributed and remain subject to the original terms.
-Third-party code under `third_party/` keeps its own licence.
+* Code in this repository and the released checkpoints: **Apache License 2.0** (`LICENSE`).
+* TrajQA-B, the processed scenes, tokens, captions and results (`data/`, `results/`, `baselines/preds`): **CC BY 4.0**,
+  the same terms as the [Stereo4D](https://stereo4d.github.io/) annotations they are derived from; cite Stereo4D
+  together with this paper. The raw videos are not redistributed and remain subject to their original terms.
+* Third-party code under `third_party/` and the base model keep their own licences.

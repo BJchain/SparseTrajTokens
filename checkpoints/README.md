@@ -1,6 +1,6 @@
 # Released checkpoints
 
-Distributed separately from the git repository. Every directory is a PEFT/transformers checkpoint directory as
+Distributed separately from the git repository: https://huggingface.co/Chenfy0407/SparseTrajTokens (private until the paper is public). Every directory is a PEFT/transformers checkpoint directory as
 written by `src/training/g1/train.py` (tokenizer / processor files included) and is loaded by
 `src/training/g1/eval.py --ckpt <dir>` on top of the base model `Qwen/Qwen3-VL-8B-Instruct`
 (`QWEN3VL_PATH`, default `checkpoints/Qwen3-VL-8B-Instruct`, not included).
