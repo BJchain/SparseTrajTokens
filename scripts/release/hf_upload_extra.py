@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--namespace", required=True)
     ap.add_argument("--mode", choices=list(REPOS), required=True)
     ap.add_argument("--shards", default="")
+    ap.add_argument("--index-only", action="store_true",
+                    help="frames: upload README + frames/INDEX.tsv + MANIFEST.tsv (deduplicated) and exit, no shards")
     a = ap.parse_args()
     name, rtype = REPOS[a.mode]; repo = f"{a.namespace}/{name}"
     private = a.mode != "frames"
@@ -135,7 +137,7 @@ def main():
     if a.mode == "frames":
         retry("gate repo", lambda: api.update_repo_settings(repo, repo_type=rtype, gated="manual"))
     card = NEW / "scripts/release" / CARDS[a.mode]
-    if card.exists() and not a.shards:
+    if card.exists() and (not a.shards or a.index_only):
         upload(card, "README.md", "card")
 
     if a.mode == "archive":
@@ -234,7 +236,7 @@ def main():
             sel = {int(x) for x in a.shards.split(",")}
         else:
             sel = set(range(H.N_SHARDS))
-        if not a.shards:
+        if not a.shards or a.index_only:
             idx = STAGE / "frames_INDEX.tsv"
             with open(idx, "w") as f:
                 f.write("clip\tshard\n")
@@ -242,6 +244,13 @@ def main():
                     for p in buckets[i]:
                         f.write(f"{p.name}\tframes/frames-{i:02d}.tar\n")
             upload(idx, "frames/INDEX.tsv", "index")
+        if a.index_only:
+            # manifest may hold duplicate (identical) lines when a shard was re-sent after a failed remote_size probe
+            dedup = STAGE / "frames_MANIFEST.dedup.tsv"
+            lines = sorted(set(open(manifest).read().splitlines())) if manifest.exists() else []
+            dedup.write_text("\n".join(lines) + "\n")
+            upload(dedup, "MANIFEST.tsv", f"manifest ({len(lines)} shards, sha256)")
+            print(f"== index-only done: {len(lines)} shards in MANIFEST", flush=True); return
         for i in range(H.N_SHARDS):
             if i not in sel: continue
             send_tar(f"frames/frames-{i:02d}.tar", [(p, p.name) for p in buckets[i]])
